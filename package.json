@@ -1,4 +1,11 @@
 {
+  "name": "goorac-push-server",
+  "version": "1.0.0",
+  "description": "Permanent Notification Server for Goorac Quantum",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
