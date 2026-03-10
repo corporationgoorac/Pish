@@ -88,15 +88,14 @@ function sendBroadcast(message) {
     }
   })
   .then((publishResponse) => {
-    console.log(`✅ Scheduled Broadcast Sent: "${message}" | ID: ${publishResponse.publishId}`);
+    console.log(`✅ Broadcast Sent: "${message}" | ID: ${publishResponse.publishId}`);
   })
   .catch((error) => {
-    console.error('❌ Error sending scheduled notification:', error);
+    console.error('❌ Error sending notification:', error);
   });
 }
 
-// --- SCHEDULES ---
-// The timezone parameter ensures it fires exactly at your local time, regardless of Render's server location.
+// --- OFFICIAL DAILY SCHEDULES ---
 
 // 1. Morning Schedule (6:45 AM)
 cron.schedule('45 6 * * *', () => {
@@ -117,3 +116,19 @@ cron.schedule('30 19 * * *', () => {
 }, { timezone: "Asia/Kolkata" });
 
 console.log('⏳ Goorac Quantum Scheduled Notification Service is running...');
+
+// =====================================================================
+// --- TEST ZONE (Delete or comment this out after confirming it works) ---
+// =====================================================================
+
+// Test 1: Fire a test notification 3 seconds after the server starts
+setTimeout(() => {
+  console.log("🛠️ Firing instant test notification...");
+  sendBroadcast("🛠️ Test: Server is online and Pusher is working!");
+}, 3000);
+
+// Test 2: Fire a test notification every 1 minute
+cron.schedule('* * * * *', () => {
+  console.log("⏱️ Firing 1-minute test cron...");
+  sendBroadcast("⏱️ Test: This is your 1-minute recurring test!");
+}, { timezone: "Asia/Kolkata" });
