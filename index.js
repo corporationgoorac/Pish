@@ -6,10 +6,19 @@ const PushNotifications = require('@pusher/push-notifications-server');
 const app = express();
 
 // --- STRICT CACHES to prevent duplicate sends and reaction spam ---
-const SERVER_START_TIME = Date.now();
+// FIXED: Set to 0. Phone clock drift was causing users with slow clocks to be permanently blocked by this check!
+const SERVER_START_TIME = 0; 
 const processedMessages = new Set();
 const processedNotifs = new Set();
 const reactionThrottle = new Set(); // Specifically limits reaction spam
+
+// --- NEW FIX: Boot Phase Lock ---
+// Prevents downloading and processing thousands of historical messages on server restart
+let isBooting = true;
+setTimeout(() => { 
+    isBooting = false; 
+    console.log("🚀 Quantum Boot Phase Complete. Live Listening Active."); 
+}, 10000); // 10-second lock
 
 // Allows your monitors to ping this server without CORS errors
 app.use(cors()); 
@@ -71,6 +80,9 @@ function startMessageListener() {
     db.collectionGroup('messages').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
+            // STRICT FIX: Ignore all historical snapshot data during the first 10 seconds
+            if (isBooting) return;
+
             // Handle both new messages AND modified messages (for reactions)
             if (change.type === 'added' || change.type === 'modified') {
                 const messageData = change.doc.data();
@@ -81,8 +93,8 @@ function startMessageListener() {
                 if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
                 if (change.doc.updateTime && change.type === 'modified') msgTime = change.doc.updateTime.toMillis();
 
-                // Ignore historical data floods on server reboot
-                if (Date.now() - msgTime > 120000) return;
+                // FIXED: Increased to 24 hours (86400000ms) to completely fix the "stops working after a while" bug caused by phone clock drift
+                if (Date.now() - msgTime > 86400000) return;
                 if (msgTime <= SERVER_START_TIME) return; 
 
                 // -----------------------------------------------------------------
@@ -95,6 +107,8 @@ function startMessageListener() {
 
                     try {
                         const senderUid = messageData.sender;
+                        if (!senderUid) return; // Safety check to prevent server crashes
+
                         const chatRef = change.doc.ref.parent.parent;
                         const chatDoc = await chatRef.get();
                         if (!chatDoc.exists) return;
@@ -140,10 +154,12 @@ function startMessageListener() {
                 if (change.type === 'modified' && messageData.reactions) {
                     try {
                         const messageOwner = messageData.sender; 
-                        
+                        if (!messageOwner) return;
+
                         for (const [reactorUid, reactionData] of Object.entries(messageData.reactions)) {
                             
                             if (reactorUid === messageOwner) continue; // Don't notify self
+                            if (!reactorUid) continue;
 
                             // STRICT THROTTLE: Prevents the "multiple notifications" bug
                             // Only allows 1 reaction notification per user, per message, every 10 seconds
@@ -152,6 +168,10 @@ function startMessageListener() {
                             
                             reactionThrottle.add(throttleKey);
                             setTimeout(() => reactionThrottle.delete(throttleKey), 10000); 
+
+                            // FIXED: Increased drift tolerance to 24 hours to stop bugs on mobile
+                            if (Date.now() - reactionData.timestamp > 86400000) continue;
+                            if (reactionData.timestamp <= SERVER_START_TIME) continue;
 
                             // Cache key to permanently log this specific emoji reaction in memory
                             const reactionCacheKey = `reaction_${docId}_${reactorUid}_${reactionData.emoji}`;
@@ -200,6 +220,10 @@ function startNotificationListener() {
 
     db.collection('notifications').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
+            
+            // STRICT FIX: Ignore all historical snapshot data during the first 10 seconds
+            if (isBooting) return;
+
             if (change.type === 'added') {
                 const docId = change.doc.id;
                 if (processedNotifs.has(docId)) return;
@@ -214,39 +238,57 @@ function startNotificationListener() {
                 else if (notifData.timestamp && notifData.timestamp.toMillis) msgTime = notifData.timestamp.toMillis();
                 else if (notifData.timestamp) msgTime = new Date(notifData.timestamp).getTime();
 
-                if (Date.now() - msgTime > 120000) return;
+                // FIXED: Increased tolerance to 24 hours to prevent dropped notifications due to client drift
+                if (Date.now() - msgTime > 86400000) return;
                 if (msgTime <= SERVER_START_TIME) return;
 
-                // BULLETPROOF ID CHECKER: Catch fields no matter what they are named
+                // BULLETPROOF ID CHECKER: Catch fields no matter what they are named in the frontend
                 const targetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId;
                 const senderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender;
                 
                 if (!targetUid || targetUid === senderUid) return; 
 
                 try {
-                    const senderName = notifData.senderName || "Someone";
-                    const senderPhoto = notifData.senderPfp || "https://www.goorac.biz/icon.png";
+                    // NEW FIX: ALWAYS fetch exact user profile to guarantee Names and PFPs are correct
+                    const senderDoc = await db.collection('users').doc(senderUid).get();
+                    const senderData = senderDoc.data() || {};
+                    const senderName = senderData.name || senderData.username || notifData.senderName || notifData.fromName || "Someone";
+                    const senderPhoto = senderData.photoURL || notifData.senderPfp || notifData.fromPfp || "https://www.goorac.biz/icon.png";
+                    
                     const deepLink = notifData.link || notifData.targetUrl || `https://www.goorac.biz/notifications.html`;
 
                     let title = "New Notification";
-                    let body = notifData.text || notifData.body; 
+                    let body = ""; 
 
+                    // Get whatever text the user sent, checking all possible frontend variables
+                    const textContent = notifData.text || notifData.body || notifData.message || notifData.comment || "";
+                    
                     // SMART WORDING: Detects exact feature based on type or URL
+                    const type = (notifData.type || "").toLowerCase();
                     const linkString = deepLink.toLowerCase();
 
-                    if (notifData.type === 'like' || notifData.type === 'note_like' || notifData.type === 'drop_like' || notifData.type === 'like_moment') {
+                    // --- 1. HANDLE LIKES ---
+                    if (type.includes('like')) {
                         title = `New Like ❤️`;
-                        if (!body) {
-                            if (linkString.includes('note')) body = `${senderName} liked your Note.`;
-                            else if (linkString.includes('drop')) body = `${senderName} liked your Drop.`;
-                            else if (linkString.includes('moment')) body = `${senderName} liked your Moment.`;
-                            else body = `${senderName} liked your post.`;
-                        }
-                    } else if (notifData.type?.includes('comment') || notifData.type?.includes('reply')) {
+                        if (type === 'note_like' || linkString.includes('note')) body = `${senderName} liked your Note.`;
+                        else if (type === 'drop_like' || linkString.includes('drop')) body = `${senderName} liked your Drop.`;
+                        else if (type === 'like_moment' || linkString.includes('moment')) body = `${senderName} liked your Moment.`;
+                        else body = `${senderName} liked your post.`;
+                    } 
+                    // --- 2. HANDLE REPLIES & COMMENTS ---
+                    else if (type.includes('reply') || type.includes('comment')) {
                         title = `New Reply 💬`;
-                        if (!body) body = `${senderName} replied to you.`;
-                    } else {
-                        if (!body) body = "Check your activity feed.";
+                        if (type === 'drop_reply' || linkString.includes('drop')) {
+                             body = textContent ? `${senderName} replied to your Drop: "${textContent}"` : `${senderName} replied to your Drop.`;
+                        } else if (type === 'note_reply' || linkString.includes('note')) {
+                             body = textContent ? `${senderName} replied to your Note: "${textContent}"` : `${senderName} replied to your Note.`;
+                        } else {
+                             body = textContent ? `${senderName} commented: "${textContent}"` : `${senderName} commented on your post.`;
+                        }
+                    } 
+                    // --- 3. FALLBACK ---
+                    else {
+                        body = textContent || "Check your activity feed.";
                     }
 
                     await beamsClient.publishToInterests([targetUid], {
@@ -254,7 +296,7 @@ function startNotificationListener() {
                         fcm: { notification: { title: title, body: body, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
                         apns: { aps: { alert: { title: title, body: body }, "thread-id": "notifications" }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                     });
-                    console.log(`✅ Event Push sent to ${targetUid}`);
+                    console.log(`✅ Event Push sent to ${targetUid} for type: ${type}`);
 
                 } catch (error) { console.error("❌ Notification Push Error:", error); }
             }
@@ -271,31 +313,29 @@ function startCallListener() {
     // 1. INCOMING CALLS (Watches the 'calls' signaling collection)
     db.collection('calls').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
+            
+            if (isBooting) return;
+
             if (change.type === 'added' || change.type === 'modified') {
                 const callData = change.doc.data();
                 if (callData.status !== 'calling') return; // Only notify if currently ringing
-
-                let msgTime = SERVER_START_TIME;
-                if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-                else if (change.doc.updateTime) msgTime = change.doc.updateTime.toMillis();
-
-                // If call is older than 30 seconds, it's likely a ghost doc, ignore it
-                if (Date.now() - msgTime > 30000) return;
-                if (msgTime <= SERVER_START_TIME) return;
 
                 const targetUid = change.doc.id; // Receiver's UID is the Document ID
                 const callerUid = callData.callerId;
                 if (!targetUid || !callerUid) return;
 
                 // Throttle calls to prevent ringing them 50 times during ICE candidate exchange
-                const throttleKey = `call_${targetUid}_${callerUid}_${msgTime}`;
+                const throttleKey = `call_${targetUid}_${callerUid}`;
                 if (processedNotifs.has(throttleKey)) return;
                 processedNotifs.add(throttleKey);
                 setTimeout(() => processedNotifs.delete(throttleKey), 45000); 
 
                 try {
-                    const callerName = callData.callerName || "Someone";
-                    const callerPhoto = callData.callerPfp || "https://www.goorac.biz/icon.png";
+                    const callerDoc = await db.collection('users').doc(callerUid).get();
+                    const callerInfo = callerDoc.data() || {};
+                    const callerName = callerInfo.name || callerInfo.username || callData.callerName || "Someone";
+                    const callerPhoto = callerInfo.photoURL || callData.callerPfp || "https://www.goorac.biz/icon.png";
+                    
                     const isVideo = callData.type === 'video';
 
                     const title = isVideo ? "Incoming Video Call 🎥" : "Incoming Audio Call 📞";
@@ -316,15 +356,12 @@ function startCallListener() {
     // 2. MISSED CALLS (Watches the 'call_logs' collection)
     db.collection('call_logs').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
+            
+            if (isBooting) return;
+
             if (change.type === 'added') {
                 const logData = change.doc.data();
                 if (logData.status !== 'missed') return; // Only notify if missed
-
-                let msgTime = SERVER_START_TIME;
-                if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-
-                if (Date.now() - msgTime > 120000) return;
-                if (msgTime <= SERVER_START_TIME) return;
 
                 const targetUid = logData.receiverId;
                 const callerUid = logData.callerId;
@@ -336,8 +373,11 @@ function startCallListener() {
                 setTimeout(() => processedNotifs.delete(docId), 180000);
 
                 try {
-                    const callerName = logData.callerName || "Someone";
-                    const callerPhoto = logData.callerPfp || "https://www.goorac.biz/icon.png";
+                    const callerDoc = await db.collection('users').doc(callerUid).get();
+                    const callerInfo = callerDoc.data() || {};
+                    const callerName = callerInfo.name || callerInfo.username || logData.callerName || "Someone";
+                    const callerPhoto = callerInfo.photoURL || logData.callerPfp || "https://www.goorac.biz/icon.png";
+                    
                     const isVideo = logData.type === 'video';
 
                     const title = "Missed Call 📵";
