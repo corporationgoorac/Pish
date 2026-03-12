@@ -216,10 +216,10 @@ function startMessageListener() {
 }
 
 // ============================================================================
-// LISTENER 2: LIKES, COMMENTS, DROPS, AND NOTES (Notifications Collection)
+// LISTENER 2: BULLETPROOF DATABASE CATCH-ALL FOR LIKES, COMMENTS, DROPS, NOTES
 // ============================================================================
 function startNotificationListener() {
-    console.log("🎧 Listening for Likes, Comments, Drops, and Notes...");
+    console.log("🎧 Listening for ALL Database Notifications (Drops, Notes, Moments, Likes)...");
 
     db.collection('notifications').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
@@ -229,6 +229,8 @@ function startNotificationListener() {
 
             if (change.type === 'added') {
                 const docId = change.doc.id;
+                
+                // Prevent duplicate processing of the same notification document
                 if (processedNotifs.has(docId)) return;
                 processedNotifs.add(docId);
                 setTimeout(() => processedNotifs.delete(docId), 180000); 
@@ -237,22 +239,29 @@ function startNotificationListener() {
                 
                 // BULLETPROOF TIMESTAMP: Uses Firestore creation time if payload timestamp is missing/broken
                 let msgTime = SERVER_START_TIME;
-                if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-                else if (notifData.timestamp && notifData.timestamp.toMillis) msgTime = notifData.timestamp.toMillis();
-                else if (notifData.timestamp) msgTime = new Date(notifData.timestamp).getTime();
+                if (change.doc.createTime) {
+                    msgTime = change.doc.createTime.toMillis();
+                } else if (notifData.timestamp && notifData.timestamp.toMillis) {
+                    msgTime = notifData.timestamp.toMillis();
+                } else if (notifData.timestamp) {
+                    msgTime = new Date(notifData.timestamp).getTime();
+                }
 
                 // FIXED: Increased tolerance to 24 hours to prevent dropped notifications due to client drift
                 if (Date.now() - msgTime > 86400000) return;
                 if (msgTime <= SERVER_START_TIME) return;
 
-                // BULLETPROOF ID CHECKER: Catch exactly what Drops, Moments, and Notes save to the DB
-                const targetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId || notifData.authorId || notifData.postOwnerId;
-                const senderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender || notifData.actorId;
+                // ==============================================================
+                // EXHAUSTIVE ID CATCHER: Guarantees we find the sender and receiver
+                // ==============================================================
+                const targetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId || notifData.authorId || notifData.postOwnerId || notifData.to || notifData.targetUser;
+                const senderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender || notifData.actorId || notifData.byUser || notifData.from;
                 
-                if (!targetUid || targetUid === senderUid) return; 
+                // Safety abort: Do not send push if IDs are missing, or if user liked their own post
+                if (!targetUid || !senderUid || targetUid === senderUid) return; 
 
                 try {
-                    // NEW FIX: ALWAYS fetch exact user profile to guarantee Names and PFPs are correct
+                    // ALWAYS fetch exact user profile from DB to guarantee Names and PFPs are 100% correct
                     const senderDoc = await db.collection('users').doc(senderUid).get();
                     const senderData = senderDoc.data() || {};
                     const senderName = senderData.name || senderData.username || notifData.senderName || notifData.fromName || "Someone";
@@ -263,61 +272,125 @@ function startNotificationListener() {
                     let title = "New Notification";
                     let body = ""; 
 
-                    // Catch text payloads from Drops (text), Moments (body/comment), and Notes (noteText)
+                    // Extract text payload no matter what the frontend named the variable
                     const textContent = notifData.text || notifData.body || notifData.message || notifData.comment || notifData.noteText || "";
                     
-                    // SMART WORDING: Detects exact feature based on type or URL
+                    // Force lowercase for foolproof string matching
                     const type = (notifData.type || "").toLowerCase();
                     const linkString = (deepLink || "").toLowerCase();
                     const textLower = textContent.toLowerCase();
 
-                    // --- 1. HANDLE LIKES ---
+                    // ==============================================================
+                    // 1. BULLETPROOF LIKE CATCHER (Drops, Notes, Moments, Posts)
+                    // ==============================================================
                     if (type.includes('like') || textLower.includes('liked')) {
                         title = `New Like ❤️`;
-                        // Specific check for Notes (since it uses type: 'like' with noteId)
-                        if (type === 'like' && notifData.noteId) body = `${senderName} liked your Note.`;
-                        else if (type.includes('note') || linkString.includes('note') || textLower.includes('note')) body = `${senderName} liked your Note.`;
-                        else if (type.includes('drop') || linkString.includes('drop') || textLower.includes('drop')) body = `${senderName} liked your Drop.`;
-                        else if (type.includes('moment') || linkString.includes('moment') || textLower.includes('moment')) body = `${senderName} liked your Moment.`;
-                        else body = `${senderName} liked your post.`;
+                        
+                        // Explicitly check for Drop indicators first
+                        if (type === 'drop_like' || type.includes('drop') || notifData.dropId || linkString.includes('drop')) {
+                            body = `${senderName} liked your Drop.`;
+                        } 
+                        // Explicitly check for Note indicators
+                        else if (type === 'note_like' || type.includes('note') || notifData.noteId || linkString.includes('note')) {
+                            body = `${senderName} liked your Note.`;
+                        } 
+                        // Explicitly check for Moment indicators
+                        else if (type === 'like_moment' || type === 'moment_like' || type.includes('moment') || notifData.momentId || linkString.includes('moment')) {
+                            body = `${senderName} liked your Moment.`;
+                        } 
+                        // Fallback for general post likes
+                        else {
+                            body = `${senderName} liked your post.`;
+                        }
                     } 
-                    // --- 2. HANDLE REPLIES & COMMENTS ---
+                    
+                    // ==============================================================
+                    // 2. BULLETPROOF REPLY & COMMENT CATCHER
+                    // ==============================================================
                     else if (type.includes('reply') || type.includes('comment') || textLower.includes('replied') || textLower.includes('commented')) {
                         title = `New Reply 💬`;
-                        if (type.includes('drop') || linkString.includes('drop') || textLower.includes('drop')) {
+                        
+                        if (type === 'drop_reply' || type.includes('drop') || notifData.dropId || linkString.includes('drop')) {
                              body = textContent ? `${senderName} replied to your Drop: "${textContent}"` : `${senderName} replied to your Drop.`;
-                        } else if (type.includes('note') || linkString.includes('note') || textLower.includes('note')) {
+                        } 
+                        else if (type === 'note_reply' || type.includes('note') || notifData.noteId || linkString.includes('note')) {
                              body = textContent ? `${senderName} replied to your Note: "${textContent}"` : `${senderName} replied to your Note.`;
-                        } else if (type.includes('moment') || linkString.includes('moment') || textLower.includes('moment')) {
+                        } 
+                        else if (type === 'moment_reply' || type === 'moment_comment' || type.includes('moment') || notifData.momentId || linkString.includes('moment')) {
                              body = textContent ? `${senderName} replied to your Moment: "${textContent}"` : `${senderName} replied to your Moment.`;
-                        } else {
+                        } 
+                        else {
                              body = textContent ? `${senderName} commented: "${textContent}"` : `${senderName} commented on your post.`;
                         }
                     } 
-                    // --- 3. HANDLE GENERIC DROPS/NOTES/MOMENTS INTERACTIONS ---
-                    else if (type.includes('drop') || type.includes('note') || type.includes('moment')) {
-                        title = `New Interaction 🔔`;
-                        if (type.includes('drop') || linkString.includes('drop')) body = `${senderName} interacted with your Drop.`;
-                        else if (type.includes('note') || linkString.includes('note')) body = `${senderName} interacted with your Note.`;
-                        else if (type.includes('moment') || linkString.includes('moment')) body = `${senderName} interacted with your Moment.`;
-                        else body = `${senderName} interacted with your post.`;
+
+                    // ==============================================================
+                    // 3. FOLLOW CATCHER
+                    // ==============================================================
+                    else if (type.includes('follow')) {
+                        title = `New Follower 👤`;
+                        body = `${senderName} started following you.`;
                     }
-                    // --- 4. FALLBACK ---
+
+                    // ==============================================================
+                    // 4. GENERIC INTERACTION FALLBACK
+                    // ==============================================================
+                    else if (type.includes('drop') || notifData.dropId) {
+                        title = `Drop Interaction 🔔`;
+                        body = `${senderName} interacted with your Drop.`;
+                    }
+                    else if (type.includes('note') || notifData.noteId) {
+                        title = `Note Interaction 🔔`;
+                        body = `${senderName} interacted with your Note.`;
+                    }
+                    else if (type.includes('moment') || notifData.momentId) {
+                        title = `Moment Interaction 🔔`;
+                        body = `${senderName} interacted with your Moment.`;
+                    }
                     else {
-                        body = textContent || "Check your activity feed.";
+                        // Ultimate fail-safe so no database event is ever missed
+                        title = `New Activity 🔔`;
+                        body = textContent || `${senderName} interacted with your profile.`;
                     }
 
+                    // Publish the final constructed notification to Pusher Beams
                     await beamsClient.publishToInterests([targetUid], {
-                        web: { notification: { title: title, body: body, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 3600 },
-                        fcm: { notification: { title: title, body: body, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
-                        apns: { aps: { alert: { title: title, body: body }, "thread-id": "notifications" }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
+                        web: { 
+                            notification: { 
+                                title: title, 
+                                body: body, 
+                                icon: senderPhoto, 
+                                deep_link: deepLink, 
+                                hide_notification_if_site_has_focus: true 
+                            }, 
+                            time_to_live: 3600 
+                        },
+                        fcm: { 
+                            notification: { 
+                                title: title, 
+                                body: body, 
+                                icon: senderPhoto 
+                            }, 
+                            data: { click_action: deepLink }, 
+                            priority: "high" 
+                        },
+                        apns: { 
+                            aps: { 
+                                alert: { title: title, body: body }, 
+                                "thread-id": "notifications" 
+                            }, 
+                            headers: { "apns-priority": "10", "apns-push-type": "alert" } 
+                        }
                     });
-                    console.log(`✅ Event Push sent to ${targetUid} for type: ${type}`);
+                    
+                    console.log(`✅ Pure DB Push sent to ${targetUid} for event type: ${type}`);
 
-                } catch (error) { console.error("❌ Notification Push Error:", error); }
+                } catch (error) { 
+                    console.error("❌ Notification Push Error:", error); 
+                }
             }
         });
-    }, (error) => { console.error("❌ Notifications listener error:", error); });
+    }, (error) => { console.error("❌ Notifications DB listener error:", error); });
 }
 
 // ============================================================================
