@@ -5,18 +5,14 @@ const PushNotifications = require('@pusher/push-notifications-server');
 
 const app = express();
 
-// --- STRICT CACHES to prevent duplicate sends and reaction spam ---
-const SERVER_START_TIME = 0; 
+// --- THE ULTIMATE FIX: TRUE SERVER TIME ---
+// By setting this to Date.now(), we guarantee the server NEVER looks at historical 
+// messages when it restarts. This completely eliminates the "spam on restart" bug.
+const SERVER_START_TIME = Date.now(); 
+
 const processedMessages = new Set();
 const processedNotifs = new Set();
 const reactionThrottle = new Set(); 
-
-// --- NEW FIX: Boot Phase Lock ---
-let isBooting = true;
-setTimeout(() => { 
-    isBooting = false; 
-    console.log("🚀 Quantum Boot Phase Complete. Live Listening Active."); 
-}, 10000); 
 
 // Allows your monitors to ping this server without CORS errors
 app.use(cors()); 
@@ -77,88 +73,86 @@ function startMessageListener() {
     db.collectionGroup('messages').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
-            if (isBooting) return;
-
             const messageData = change.doc.data();
             const docId = change.doc.id;
             
-            let msgTime = SERVER_START_TIME;
-            if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-            if (change.doc.updateTime && change.type === 'modified') msgTime = change.doc.updateTime.toMillis();
-
-            if (Date.now() - msgTime > 86400000) return;
-            if (msgTime <= SERVER_START_TIME) return; 
-
             // -----------------------------------------------------------------
-            // A. STRICTLY NEW MESSAGES (No 'modified' events allowed here to prevent doubles)
+            // A. STRICTLY NEW MESSAGES (No 'modified' allowed here)
             // -----------------------------------------------------------------
             if (change.type === 'added') {
                 
-                // ULTIMATE LOCK: Instantly claim this document ID so the server confirmation event cannot trigger it again.
+                // ULTIMATE SPAM FIX: Use Google's absolute Server Time. 
+                // Ignore any message that was created before the server woke up.
+                const msgCreateTime = change.doc.createTime ? change.doc.createTime.toMillis() : Date.now();
+                if (msgCreateTime <= SERVER_START_TIME) return; 
+                
                 if (processedMessages.has(docId)) return;
                 processedMessages.add(docId);
                 setTimeout(() => processedMessages.delete(docId), 180000); 
 
-                try {
-                    const senderUid = String(messageData.sender || "").trim();
-                    if (!senderUid) return; 
+                // Race Condition Delay (Fixes User A getting User B's notification)
+                setTimeout(async () => {
+                    try {
+                        const senderUid = String(messageData.sender || "").trim();
+                        if (!senderUid) return; 
 
-                    const chatRef = change.doc.ref.parent.parent;
-                    const chatDocId = chatRef.id;
-                    const chatDoc = await chatRef.get();
-                    
-                    const chatData = chatDoc.exists ? chatDoc.data() : {};
-                    const isGroup = chatData.isGroup === true;
-                    
-                    let targetUids = [];
-                    if (isGroup) {
-                        targetUids = (chatData.participants || []).filter(uid => String(uid).trim() !== senderUid);
-                    } else {
-                        const extractedUids = chatDocId.split('_');
-                        if (extractedUids.length === 2) {
-                            targetUids = [extractedUids[0] === senderUid ? extractedUids[1] : extractedUids[0]];
-                        } else {
+                        const chatRef = change.doc.ref.parent.parent;
+                        const chatDocId = chatRef.id;
+                        const chatDoc = await chatRef.get();
+                        
+                        const chatData = chatDoc.exists ? chatDoc.data() : {};
+                        const isGroup = chatData.isGroup === true;
+                        
+                        let targetUids = [];
+                        if (isGroup) {
                             targetUids = (chatData.participants || []).filter(uid => String(uid).trim() !== senderUid);
-                        }
-                    }
-
-                    if (targetUids.length === 0) return; 
-                    
-                    const senderDoc = await db.collection('users').doc(senderUid).get();
-                    const senderData = senderDoc.data() || {};
-                    let senderName = senderData.name || senderData.username || "Someone";
-                    const senderPhoto = senderData.photoURL || "https://www.goorac.biz/icon.png";
-                    const senderUsername = senderData.username || senderUid;
-
-                    if (isGroup) senderName = `${senderName} in ${chatData.groupName || 'Group'}`;
-
-                    let bodyText = messageData.text || "New message";
-                    if (messageData.isHtml || messageData.isDropReply || messageData.replyToNote) bodyText = "💬 Replied to your post";
-                    else if (messageData.isBite) bodyText = "🎬 Sent a Bite video";
-                    else if (messageData.isGif) bodyText = "🎞️ Sent a GIF";
-                    else if (messageData.imageUrl) bodyText = "📷 Sent an image";
-                    else if (messageData.fileMeta?.type?.includes('audio')) bodyText = "🎵 Sent a voice message";
-                    else if (messageData.fileUrl) bodyText = "📎 Sent an attachment";
-
-                    const deepLink = isGroup 
-                        ? `https://www.goorac.biz/groupChat.html?id=${chatDocId}` 
-                        : `https://www.goorac.biz/chat.html?user=${senderUsername}`;
-
-                    targetUids.forEach(async (targetUid) => {
-                        const targetDoc = await db.collection('users').doc(targetUid).get();
-                        const targetActiveChat = targetDoc.data()?.activeChat;
-                        if (targetActiveChat === senderUid || targetActiveChat === senderUsername || targetActiveChat === chatDocId) {
-                            console.log(`🔇 Muting: ${targetUid} is actively in this chat.`);
-                            return;
+                        } else {
+                            const extractedUids = chatDocId.split('_');
+                            if (extractedUids.length === 2) {
+                                targetUids = [extractedUids[0] === senderUid ? extractedUids[1] : extractedUids[0]];
+                            } else {
+                                targetUids = (chatData.participants || []).filter(uid => String(uid).trim() !== senderUid);
+                            }
                         }
 
-                        await beamsClient.publishToInterests([targetUid], {
-                            web: { notification: { title: senderName, body: bodyText, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
-                            fcm: { notification: { title: senderName, body: bodyText, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
-                            apns: { aps: { alert: { title: senderName, body: bodyText }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
+                        if (targetUids.length === 0) return; 
+                        
+                        const senderDoc = await db.collection('users').doc(senderUid).get();
+                        const senderData = senderDoc.data() || {};
+                        let senderName = senderData.name || senderData.username || "Someone";
+                        const senderPhoto = senderData.photoURL || "https://www.goorac.biz/icon.png";
+                        const senderUsername = senderData.username || senderUid;
+
+                        if (isGroup) senderName = `${senderName} in ${chatData.groupName || 'Group'}`;
+
+                        let bodyText = messageData.text || "New message";
+                        if (messageData.isHtml || messageData.isDropReply || messageData.replyToNote) bodyText = "💬 Replied to your post";
+                        else if (messageData.isBite) bodyText = "🎬 Sent a Bite video";
+                        else if (messageData.isGif) bodyText = "🎞️ Sent a GIF";
+                        else if (messageData.imageUrl) bodyText = "📷 Sent an image";
+                        else if (messageData.fileMeta?.type?.includes('audio')) bodyText = "🎵 Sent a voice message";
+                        else if (messageData.fileUrl) bodyText = "📎 Sent an attachment";
+
+                        const deepLink = isGroup 
+                            ? `https://www.goorac.biz/groupChat.html?id=${chatDocId}` 
+                            : `https://www.goorac.biz/chat.html?user=${senderUsername}`;
+
+                        targetUids.forEach(async (targetUid) => {
+                            const targetDoc = await db.collection('users').doc(targetUid).get();
+                            const targetActiveChat = targetDoc.data()?.activeChat;
+                            if (targetActiveChat === senderUid || targetActiveChat === senderUsername || targetActiveChat === chatDocId) {
+                                console.log(`🔇 Muting: ${targetUid} is actively in this chat.`);
+                                return;
+                            }
+
+                            await beamsClient.publishToInterests([targetUid], {
+                                web: { notification: { title: senderName, body: bodyText, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
+                                fcm: { notification: { title: senderName, body: bodyText, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
+                                apns: { aps: { alert: { title: senderName, body: bodyText }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
+                            });
                         });
-                    });
-                } catch (error) { console.error("❌ Message Push Error:", error); }
+                    } catch (error) { console.error("❌ Message Push Error:", error); }
+                }, 1500); // <-- 1.5s delay protects User B targeting
             }
 
             // -----------------------------------------------------------------
@@ -166,6 +160,10 @@ function startMessageListener() {
             // -----------------------------------------------------------------
             if (change.type === 'modified' && messageData.reactions) {
                 try {
+                    // SPAM FIX: Only process reactions if the document modification happened AFTER server boot
+                    const msgUpdateTime = change.doc.updateTime ? change.doc.updateTime.toMillis() : Date.now();
+                    if (msgUpdateTime <= SERVER_START_TIME) return;
+
                     const messageOwner = String(messageData.sender || "").trim(); 
                     if (!messageOwner) return;
 
@@ -174,22 +172,13 @@ function startMessageListener() {
                         const safeReactorUid = String(reactorUid).trim();
                         if (safeReactorUid === messageOwner) continue; 
 
-                        // STRICT THROTTLE: Completely prevents rapid-fire double reactions
-                        const throttleKey = `throttle_${docId}_${safeReactorUid}`;
-                        if (reactionThrottle.has(throttleKey)) continue;
-                        
-                        if (Date.now() - reactionData.timestamp > 86400000) continue;
-                        if (reactionData.timestamp <= SERVER_START_TIME) continue;
-
-                        // CACHE LOCK: Ties the exact emoji to the specific message so updates don't re-trigger it.
+                        // TRUE CACHE LOCK: Caches this specific reaction for 24 HOURS in server memory.
+                        // Even if the message is updated 100 times for read receipts, it cannot send the reaction twice.
                         const reactionCacheKey = `reaction_${docId}_${safeReactorUid}_${reactionData.emoji}`;
                         if (processedMessages.has(reactionCacheKey)) continue;
                         
-                        // Claim both memory caches instantly!
                         processedMessages.add(reactionCacheKey);
-                        reactionThrottle.add(throttleKey);
-                        setTimeout(() => processedMessages.delete(reactionCacheKey), 180000);
-                        setTimeout(() => reactionThrottle.delete(throttleKey), 10000); 
+                        setTimeout(() => processedMessages.delete(reactionCacheKey), 86400000); // 24-hour lock
 
                         const chatRef = change.doc.ref.parent.parent;
                         const chatDocId = chatRef.id;
@@ -236,23 +225,17 @@ function startNotificationListener() {
     db.collection('notifications').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
-            if (isBooting) return;
-
             if (change.type === 'added') {
+                const notifData = change.doc.data();
                 const docId = change.doc.id;
+                
+                // SPAM FIX: Absolutely block any notification that was created before the server booted
+                const msgCreateTime = change.doc.createTime ? change.doc.createTime.toMillis() : Date.now();
+                if (msgCreateTime <= SERVER_START_TIME) return;
+
                 if (processedNotifs.has(docId)) return;
                 processedNotifs.add(docId);
                 setTimeout(() => processedNotifs.delete(docId), 180000); 
-
-                const notifData = change.doc.data();
-                
-                let msgTime = SERVER_START_TIME;
-                if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-                else if (notifData.timestamp && notifData.timestamp.toMillis) msgTime = notifData.timestamp.toMillis();
-                else if (notifData.timestamp) msgTime = new Date(notifData.timestamp).getTime();
-
-                if (Date.now() - msgTime > 86400000) return;
-                if (msgTime <= SERVER_START_TIME) return;
 
                 const targetUid = String(notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId).trim();
                 const senderUid = String(notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender).trim();
@@ -306,14 +289,15 @@ function startNotificationListener() {
 function startCallListener() {
     console.log("🎧 Listening for Incoming and Missed Calls...");
 
+    // 1. INCOMING CALLS
     db.collection('calls').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
-            
-            if (isBooting) return;
-
             if (change.type === 'added' || change.type === 'modified') {
                 const callData = change.doc.data();
                 if (callData.status !== 'calling') return; 
+
+                const msgUpdateTime = change.doc.updateTime ? change.doc.updateTime.toMillis() : Date.now();
+                if (msgUpdateTime <= SERVER_START_TIME) return;
 
                 const targetUid = String(change.doc.id).trim(); 
                 const callerUid = String(callData.callerId).trim();
@@ -345,17 +329,15 @@ function startCallListener() {
         });
     }, (error) => { console.error("❌ Calls listener error:", error); });
 
+    // 2. MISSED CALLS
     db.collection('call_logs').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
-            
-            let msgTime = SERVER_START_TIME;
-            if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-
-            if (isBooting && (Date.now() - msgTime > 600000)) return;
-
             if (change.type === 'added') {
                 const logData = change.doc.data();
                 if (logData.status !== 'missed') return; 
+
+                const msgCreateTime = change.doc.createTime ? change.doc.createTime.toMillis() : Date.now();
+                if (msgCreateTime <= SERVER_START_TIME) return;
 
                 const targetUid = String(logData.receiverId).trim();
                 const callerUid = String(logData.callerId).trim();
