@@ -110,11 +110,30 @@ function startMessageListener() {
                         if (!senderUid) return; // Safety check to prevent server crashes
 
                         const chatRef = change.doc.ref.parent.parent;
+                        const chatDocId = chatRef.id;
                         const chatDoc = await chatRef.get();
-                        if (!chatDoc.exists) return;
                         
-                        const chatData = chatDoc.data();
-                        const participants = chatData.participants || [];
+                        // RACE CONDITION FIX: Do not rely solely on the document existing. 
+                        // It might not be fully written yet by the frontend!
+                        const chatData = chatDoc.exists ? chatDoc.data() : {};
+                        const isGroup = chatData.isGroup === true;
+                        
+                        let targetUids = [];
+                        
+                        if (isGroup) {
+                            // Group chats must read from participants array
+                            targetUids = (chatData.participants || []).filter(uid => uid !== senderUid);
+                        } else {
+                            // 1-on-1 chats mathematically extract the target from the ID string instantly!
+                            const extractedUids = chatDocId.split('_');
+                            if (extractedUids.length === 2) {
+                                targetUids = [extractedUids[0] === senderUid ? extractedUids[1] : extractedUids[0]];
+                            } else {
+                                targetUids = (chatData.participants || []).filter(uid => uid !== senderUid);
+                            }
+                        }
+
+                        if (targetUids.length === 0) return; // Abort if no target found
                         
                         const senderDoc = await db.collection('users').doc(senderUid).get();
                         const senderData = senderDoc.data() || {};
@@ -122,7 +141,7 @@ function startMessageListener() {
                         const senderPhoto = senderData.photoURL || "https://www.goorac.biz/icon.png";
                         const senderUsername = senderData.username || senderUid;
 
-                        if (chatData.isGroup) senderName = `${senderName} in ${chatData.groupName || 'Group'}`;
+                        if (isGroup) senderName = `${senderName} in ${chatData.groupName || 'Group'}`;
 
                         let bodyText = messageData.text || "New message";
                         if (messageData.isHtml || messageData.isDropReply || messageData.replyToNote) bodyText = "💬 Replied to your post";
@@ -132,17 +151,15 @@ function startMessageListener() {
                         else if (messageData.fileMeta?.type?.includes('audio')) bodyText = "🎵 Sent a voice message";
                         else if (messageData.fileUrl) bodyText = "📎 Sent an attachment";
 
-                        const deepLink = chatData.isGroup 
-                            ? `https://www.goorac.biz/groupChat.html?id=${chatDoc.id}` 
+                        const deepLink = isGroup 
+                            ? `https://www.goorac.biz/groupChat.html?id=${chatDocId}` 
                             : `https://www.goorac.biz/chat.html?user=${senderUsername}`;
 
-                        participants.forEach(async (targetUid) => {
-                            if (targetUid === senderUid) return;
-
+                        targetUids.forEach(async (targetUid) => {
                             await beamsClient.publishToInterests([targetUid], {
                                 web: { notification: { title: senderName, body: bodyText, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 3600 },
                                 fcm: { notification: { title: senderName, body: bodyText, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
-                                apns: { aps: { alert: { title: senderName, body: bodyText }, "thread-id": chatDoc.id }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
+                                apns: { aps: { alert: { title: senderName, body: bodyText }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                             });
                         });
                     } catch (error) { console.error("❌ Message Push Error:", error); }
@@ -180,9 +197,12 @@ function startMessageListener() {
                             setTimeout(() => processedMessages.delete(reactionCacheKey), 180000);
 
                             const chatRef = change.doc.ref.parent.parent;
+                            const chatDocId = chatRef.id;
                             const chatDoc = await chatRef.get();
-                            if (!chatDoc.exists) continue;
-                            const chatData = chatDoc.data();
+                            
+                            // Safe fetching of group data
+                            const chatData = chatDoc.exists ? chatDoc.data() : {};
+                            const isGroup = chatData.isGroup === true;
 
                             const reactorDoc = await db.collection('users').doc(reactorUid).get();
                             const reactorInfo = reactorDoc.data() || {};
@@ -190,19 +210,19 @@ function startMessageListener() {
                             const reactorPhoto = reactorInfo.photoURL || "https://www.goorac.biz/icon.png";
                             const reactorUsername = reactorInfo.username || reactorUid;
 
-                            if (chatData.isGroup) reactorName = `${reactorName} in ${chatData.groupName || 'Group'}`;
+                            if (isGroup) reactorName = `${reactorName} in ${chatData.groupName || 'Group'}`;
 
-                            const title = chatData.isGroup ? reactorName : `New Reaction`;
-                            const body = `${chatData.isGroup ? reactorName.split(' ')[0] : reactorName} reacted ${reactionData.emoji} to your message.`;
+                            const title = isGroup ? reactorName : `New Reaction`;
+                            const body = `${isGroup ? reactorName.split(' ')[0] : reactorName} reacted ${reactionData.emoji} to your message.`;
 
-                            const deepLink = chatData.isGroup 
-                                ? `https://www.goorac.biz/groupChat.html?id=${chatDoc.id}` 
+                            const deepLink = isGroup 
+                                ? `https://www.goorac.biz/groupChat.html?id=${chatDocId}` 
                                 : `https://www.goorac.biz/chat.html?user=${reactorUsername}`;
 
                             await beamsClient.publishToInterests([messageOwner], {
                                 web: { notification: { title: title, body: body, icon: reactorPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 3600 },
                                 fcm: { notification: { title: title, body: body, icon: reactorPhoto }, data: { click_action: deepLink }, priority: "high" },
-                                apns: { aps: { alert: { title: title, body: body }, "thread-id": chatDoc.id }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
+                                apns: { aps: { alert: { title: title, body: body }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                             });
                         }
                     } catch (err) { console.error("❌ Reaction Push Error:", err); }
@@ -357,7 +377,11 @@ function startCallListener() {
     db.collection('call_logs').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
-            if (isBooting) return;
+            let msgTime = SERVER_START_TIME;
+            if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
+
+            // STRICT FIX: Ignore historical data on boot, BUT allow missed calls from the last 10 minutes
+            if (isBooting && (Date.now() - msgTime > 600000)) return;
 
             if (change.type === 'added') {
                 const logData = change.doc.data();
