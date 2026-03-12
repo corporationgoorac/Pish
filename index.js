@@ -245,9 +245,9 @@ function startNotificationListener() {
                 if (Date.now() - msgTime > 86400000) return;
                 if (msgTime <= SERVER_START_TIME) return;
 
-                // BULLETPROOF ID CHECKER: Catch fields no matter what they are named in the frontend
-                const targetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId || notifData.authorId || notifData.postOwnerId || notifData.uid || notifData.user;
-                const senderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender || notifData.actorId || notifData.byUser;
+                // BULLETPROOF ID CHECKER: Catch exactly what Drops, Moments, and Notes save to the DB
+                const targetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId || notifData.authorId || notifData.postOwnerId;
+                const senderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender || notifData.actorId;
                 
                 if (!targetUid || targetUid === senderUid) return; 
 
@@ -263,10 +263,10 @@ function startNotificationListener() {
                     let title = "New Notification";
                     let body = ""; 
 
-                    // Get whatever text the user sent, checking all possible frontend variables
-                    const textContent = notifData.text || notifData.body || notifData.message || notifData.comment || "";
+                    // Catch text payloads from Drops (text), Moments (body/comment), and Notes (noteText)
+                    const textContent = notifData.text || notifData.body || notifData.message || notifData.comment || notifData.noteText || "";
                     
-                    // SMART WORDING: Detects exact feature based on type, URL, or raw text content
+                    // SMART WORDING: Detects exact feature based on type or URL
                     const type = (notifData.type || "").toLowerCase();
                     const linkString = (deepLink || "").toLowerCase();
                     const textLower = textContent.toLowerCase();
@@ -274,7 +274,9 @@ function startNotificationListener() {
                     // --- 1. HANDLE LIKES ---
                     if (type.includes('like') || textLower.includes('liked')) {
                         title = `New Like ❤️`;
-                        if (type.includes('note') || linkString.includes('note') || textLower.includes('note')) body = `${senderName} liked your Note.`;
+                        // Specific check for Notes (since it uses type: 'like' with noteId)
+                        if (type === 'like' && notifData.noteId) body = `${senderName} liked your Note.`;
+                        else if (type.includes('note') || linkString.includes('note') || textLower.includes('note')) body = `${senderName} liked your Note.`;
                         else if (type.includes('drop') || linkString.includes('drop') || textLower.includes('drop')) body = `${senderName} liked your Drop.`;
                         else if (type.includes('moment') || linkString.includes('moment') || textLower.includes('moment')) body = `${senderName} liked your Moment.`;
                         else body = `${senderName} liked your post.`;
