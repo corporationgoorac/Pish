@@ -63,19 +63,20 @@ function startMessageListener() {
     db.collectionGroup('messages').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
+            // RELIABLE TIMESTAMP: Uses Firestore's un-hackable create/update time
+            let msgTime = SERVER_START_TIME;
+            if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
+            if (change.doc.updateTime && change.type === 'modified') msgTime = change.doc.updateTime.toMillis();
+
             // STRICT FIX: Ignore all historical snapshot data during the first 10 seconds
-            if (isBooting) return;
+            // PWA FIX: We now allow messages from the last 60 seconds through during boot to prevent dropping them on server restart
+            if (isBooting && (Date.now() - msgTime > 60000)) return;
 
             // Handle both new messages AND modified messages (for reactions)
             if (change.type === 'added' || change.type === 'modified') {
                 const messageData = change.doc.data();
                 const docId = change.doc.id;
                 
-                // RELIABLE TIMESTAMP: Uses Firestore's un-hackable create/update time
-                let msgTime = SERVER_START_TIME;
-                if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-                if (change.doc.updateTime && change.type === 'modified') msgTime = change.doc.updateTime.toMillis();
-
                 // FIXED: Increased to 24 hours (86400000ms) to completely fix the "stops working after a while" bug caused by phone clock drift
                 if (Date.now() - msgTime > 86400000) return;
                 if (msgTime <= SERVER_START_TIME) return; 
@@ -89,7 +90,8 @@ function startMessageListener() {
                     setTimeout(() => processedMessages.delete(docId), 180000); 
 
                     try {
-                        const senderUid = messageData.sender;
+                        // PWA FIX: Force string and trim to prevent silent failure if spaces exist
+                        const senderUid = String(messageData.sender || "").trim();
                         if (!senderUid) return; // Safety check to prevent server crashes
 
                         const chatRef = change.doc.ref.parent.parent;
@@ -105,14 +107,14 @@ function startMessageListener() {
                         
                         if (isGroup) {
                             // Group chats must read from participants array
-                            targetUids = (chatData.participants || []).filter(uid => uid !== senderUid);
+                            targetUids = (chatData.participants || []).filter(uid => String(uid).trim() !== senderUid).map(uid => String(uid).trim());
                         } else {
                             // 1-on-1 chats mathematically extract the target from the ID string instantly!
                             const extractedUids = chatDocId.split('_');
                             if (extractedUids.length === 2) {
-                                targetUids = [extractedUids[0] === senderUid ? extractedUids[1] : extractedUids[0]];
+                                targetUids = [String(extractedUids[0]).trim() === senderUid ? String(extractedUids[1]).trim() : String(extractedUids[0]).trim()];
                             } else {
-                                targetUids = (chatData.participants || []).filter(uid => uid !== senderUid);
+                                targetUids = (chatData.participants || []).filter(uid => String(uid).trim() !== senderUid).map(uid => String(uid).trim());
                             }
                         }
 
@@ -139,8 +141,11 @@ function startMessageListener() {
                             : `https://www.goorac.biz/chat.html?user=${senderUsername}`;
 
                         targetUids.forEach(async (targetUid) => {
+                            if(!targetUid) return;
                             await beamsClient.publishToInterests([targetUid], {
-                                web: { notification: { title: senderName, body: bodyText, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 3600 },
+                                // PWA FIX: Changed hide_notification_if_site_has_focus to FALSE. 
+                                // PWAs often falsely report as focused when suspended in the background.
+                                web: { notification: { title: senderName, body: bodyText, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
                                 fcm: { notification: { title: senderName, body: bodyText, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
                                 apns: { aps: { alert: { title: senderName, body: bodyText }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                             });
@@ -153,11 +158,12 @@ function startMessageListener() {
                 // -----------------------------------------------------------------
                 if (change.type === 'modified' && messageData.reactions) {
                     try {
-                        const messageOwner = messageData.sender; 
+                        const messageOwner = String(messageData.sender || "").trim(); 
                         if (!messageOwner) return;
 
-                        for (const [reactorUid, reactionData] of Object.entries(messageData.reactions)) {
+                        for (const [rawReactorUid, reactionData] of Object.entries(messageData.reactions)) {
                             
+                            const reactorUid = String(rawReactorUid).trim();
                             if (reactorUid === messageOwner) continue; // Don't notify self
                             if (!reactorUid) continue;
 
@@ -203,7 +209,8 @@ function startMessageListener() {
                                 : `https://www.goorac.biz/chat.html?user=${reactorUsername}`;
 
                             await beamsClient.publishToInterests([messageOwner], {
-                                web: { notification: { title: title, body: body, icon: reactorPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 3600 },
+                                // PWA FIX: Changed hide_notification_if_site_has_focus to FALSE.
+                                web: { notification: { title: title, body: body, icon: reactorPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
                                 fcm: { notification: { title: title, body: body, icon: reactorPhoto }, data: { click_action: deepLink }, priority: "high" },
                                 apns: { aps: { alert: { title: title, body: body }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                             });
@@ -224,8 +231,17 @@ function startNotificationListener() {
     db.collection('notifications').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
+            const notifData = change.doc.data();
+                
+            // BULLETPROOF TIMESTAMP: Uses Firestore creation time if payload timestamp is missing/broken
+            let msgTime = SERVER_START_TIME;
+            if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
+            else if (notifData.timestamp && notifData.timestamp.toMillis) msgTime = notifData.timestamp.toMillis();
+            else if (notifData.timestamp) msgTime = new Date(notifData.timestamp).getTime();
+
             // STRICT FIX: Ignore all historical snapshot data during the first 10 seconds
-            if (isBooting) return;
+            // PWA FIX: Moved msgTime calc up here. Allow recent missed notifications through during boot.
+            if (isBooting && (Date.now() - msgTime > 60000)) return;
 
             if (change.type === 'added') {
                 const docId = change.doc.id;
@@ -233,22 +249,18 @@ function startNotificationListener() {
                 processedNotifs.add(docId);
                 setTimeout(() => processedNotifs.delete(docId), 180000); 
 
-                const notifData = change.doc.data();
-                
-                // BULLETPROOF TIMESTAMP: Uses Firestore creation time if payload timestamp is missing/broken
-                let msgTime = SERVER_START_TIME;
-                if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-                else if (notifData.timestamp && notifData.timestamp.toMillis) msgTime = notifData.timestamp.toMillis();
-                else if (notifData.timestamp) msgTime = new Date(notifData.timestamp).getTime();
-
                 // FIXED: Increased tolerance to 24 hours to prevent dropped notifications due to client drift
                 if (Date.now() - msgTime > 86400000) return;
                 if (msgTime <= SERVER_START_TIME) return;
 
                 // BULLETPROOF ID CHECKER: Catch fields no matter what they are named in the frontend
-                const targetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId;
-                const senderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender;
+                const rawTargetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId;
+                const rawSenderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender;
                 
+                // PWA FIX: Ensure strings are perfectly clean
+                const targetUid = String(rawTargetUid || "").trim();
+                const senderUid = String(rawSenderUid || "").trim();
+
                 if (!targetUid || targetUid === senderUid) return; 
 
                 try {
@@ -295,7 +307,8 @@ function startNotificationListener() {
                     }
 
                     await beamsClient.publishToInterests([targetUid], {
-                        web: { notification: { title: title, body: body, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 3600 },
+                        // PWA FIX: Changed hide_notification_if_site_has_focus to FALSE.
+                        web: { notification: { title: title, body: body, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
                         fcm: { notification: { title: title, body: body, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
                         apns: { aps: { alert: { title: title, body: body }, "thread-id": "notifications" }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                     });
@@ -323,8 +336,9 @@ function startCallListener() {
                 const callData = change.doc.data();
                 if (callData.status !== 'calling') return; // Only notify if currently ringing
 
-                const targetUid = change.doc.id; // Receiver's UID is the Document ID
-                const callerUid = callData.callerId;
+                // PWA FIX: Enforce clean strings for UIDs
+                const targetUid = String(change.doc.id || "").trim(); // Receiver's UID is the Document ID
+                const callerUid = String(callData.callerId || "").trim();
                 if (!targetUid || !callerUid) return;
 
                 // Throttle calls to prevent ringing them 50 times during ICE candidate exchange
@@ -346,7 +360,8 @@ function startCallListener() {
                     const deepLink = `https://www.goorac.biz/calls.html`;
 
                     await beamsClient.publishToInterests([targetUid], {
-                        web: { notification: { title, body, icon: callerPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 60 }, // Expires quickly
+                        // PWA FIX: Changed hide_notification_if_site_has_focus to FALSE.
+                        web: { notification: { title, body, icon: callerPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 60 }, // Expires quickly
                         fcm: { notification: { title, body, icon: callerPhoto }, data: { click_action: deepLink }, priority: "high" },
                         apns: { aps: { alert: { title, body }, "thread-id": "calls" }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                     });
@@ -370,8 +385,9 @@ function startCallListener() {
                 const logData = change.doc.data();
                 if (logData.status !== 'missed') return; // Only notify if missed
 
-                const targetUid = logData.receiverId;
-                const callerUid = logData.callerId;
+                // PWA FIX: Clean UIDs
+                const targetUid = String(logData.receiverId || "").trim();
+                const callerUid = String(logData.callerId || "").trim();
                 if (!targetUid || targetUid === callerUid) return;
 
                 const docId = change.doc.id;
@@ -392,7 +408,8 @@ function startCallListener() {
                     const deepLink = `https://www.goorac.biz/calls.html`;
 
                     await beamsClient.publishToInterests([targetUid], {
-                        web: { notification: { title, body, icon: callerPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 3600 },
+                        // PWA FIX: Changed hide_notification_if_site_has_focus to FALSE.
+                        web: { notification: { title, body, icon: callerPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
                         fcm: { notification: { title, body, icon: callerPhoto }, data: { click_action: deepLink }, priority: "high" },
                         apns: { aps: { alert: { title, body }, "thread-id": "calls" }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                     });
