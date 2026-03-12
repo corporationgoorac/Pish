@@ -6,9 +6,19 @@ const PushNotifications = require('@pusher/push-notifications-server');
 const app = express();
 
 // --- STRICT CACHES to prevent duplicate sends and reaction spam ---
+// FIXED: Set to 0. Phone clock drift was causing users with slow clocks to be permanently blocked by this check!
+const SERVER_START_TIME = 0; 
 const processedMessages = new Set();
 const processedNotifs = new Set();
-const reactionThrottle = new Set(); 
+const reactionThrottle = new Set(); // Specifically limits reaction spam
+
+// --- NEW FIX: Boot Phase Lock ---
+// Prevents downloading and processing thousands of historical messages on server restart
+let isBooting = true;
+setTimeout(() => { 
+    isBooting = false; 
+    console.log("🚀 Quantum Boot Phase Complete. Live Listening Active."); 
+}, 10000); // 10-second lock
 
 // Allows your monitors to ping this server without CORS errors
 app.use(cors()); 
@@ -53,22 +63,25 @@ function startMessageListener() {
     db.collectionGroup('messages').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
+            // STRICT FIX: Ignore all historical snapshot data during the first 10 seconds
+            if (isBooting) return;
+
+            // Handle both new messages AND modified messages (for reactions)
             if (change.type === 'added' || change.type === 'modified') {
                 const messageData = change.doc.data();
                 const docId = change.doc.id;
                 
-                // RELIABLE TIMESTAMP: Uses Firestore's un-hackable server-side times
-                let msgTime = 0;
+                // RELIABLE TIMESTAMP: Uses Firestore's un-hackable create/update time
+                let msgTime = SERVER_START_TIME;
                 if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
                 if (change.doc.updateTime && change.type === 'modified') msgTime = change.doc.updateTime.toMillis();
 
-                // CRITICAL FIX: Only process events that occurred in the last 2 minutes (120000ms).
-                // This completely prevents historical notification spam on server restart, 
-                // while ensuring that the action that woke the server up STILL gets processed properly!
-                if (!msgTime || Date.now() - msgTime > 120000) return;
+                // FIXED: Increased to 24 hours (86400000ms) to completely fix the "stops working after a while" bug caused by phone clock drift
+                if (Date.now() - msgTime > 86400000) return;
+                if (msgTime <= SERVER_START_TIME) return; 
 
                 // -----------------------------------------------------------------
-                // A. HANDLE BRAND NEW MESSAGES & REPLIES
+                // A. HANDLE BRAND NEW MESSAGES
                 // -----------------------------------------------------------------
                 if (change.type === 'added') {
                     if (processedMessages.has(docId)) return;
@@ -77,20 +90,24 @@ function startMessageListener() {
 
                     try {
                         const senderUid = messageData.sender;
-                        if (!senderUid) return; 
+                        if (!senderUid) return; // Safety check to prevent server crashes
 
                         const chatRef = change.doc.ref.parent.parent;
                         const chatDocId = chatRef.id;
                         const chatDoc = await chatRef.get();
                         
+                        // RACE CONDITION FIX: Do not rely solely on the document existing. 
+                        // It might not be fully written yet by the frontend!
                         const chatData = chatDoc.exists ? chatDoc.data() : {};
                         const isGroup = chatData.isGroup === true;
                         
                         let targetUids = [];
                         
                         if (isGroup) {
+                            // Group chats must read from participants array
                             targetUids = (chatData.participants || []).filter(uid => uid !== senderUid);
                         } else {
+                            // 1-on-1 chats mathematically extract the target from the ID string instantly!
                             const extractedUids = chatDocId.split('_');
                             if (extractedUids.length === 2) {
                                 targetUids = [extractedUids[0] === senderUid ? extractedUids[1] : extractedUids[0]];
@@ -99,7 +116,7 @@ function startMessageListener() {
                             }
                         }
 
-                        if (targetUids.length === 0) return; 
+                        if (targetUids.length === 0) return; // Abort if no target found
                         
                         const senderDoc = await db.collection('users').doc(senderUid).get();
                         const senderData = senderDoc.data() || {};
@@ -109,20 +126,13 @@ function startMessageListener() {
 
                         if (isGroup) senderName = `${senderName} in ${chatData.groupName || 'Group'}`;
 
-                        // SMART HTML/REPLY FILTERING: Extracts rawText to prevent HTML div tags showing in notifications
-                        let bodyText = "New message";
-                        if (messageData.rawText) {
-                            bodyText = messageData.rawText;
-                        } else if (messageData.text && !messageData.isHtml && !messageData.text.includes('<div')) {
-                            bodyText = messageData.text;
-                        } else {
-                            if (messageData.isDropReply || messageData.replyToNote || messageData.isHtml) bodyText = "💬 Replied to your post";
-                            else if (messageData.isBite) bodyText = "🎬 Sent a Bite video";
-                            else if (messageData.isGif) bodyText = "🎞️ Sent a GIF";
-                            else if (messageData.imageUrl) bodyText = "📷 Sent an image";
-                            else if (messageData.fileMeta?.type?.includes('audio')) bodyText = "🎵 Sent a voice message";
-                            else if (messageData.fileUrl) bodyText = "📎 Sent an attachment";
-                        }
+                        let bodyText = messageData.text || "New message";
+                        if (messageData.isHtml || messageData.isDropReply || messageData.replyToNote) bodyText = "💬 Replied to your post";
+                        else if (messageData.isBite) bodyText = "🎬 Sent a Bite video";
+                        else if (messageData.isGif) bodyText = "🎞️ Sent a GIF";
+                        else if (messageData.imageUrl) bodyText = "📷 Sent an image";
+                        else if (messageData.fileMeta?.type?.includes('audio')) bodyText = "🎵 Sent a voice message";
+                        else if (messageData.fileUrl) bodyText = "📎 Sent an attachment";
 
                         const deepLink = isGroup 
                             ? `https://www.goorac.biz/groupChat.html?id=${chatDocId}` 
@@ -148,18 +158,22 @@ function startMessageListener() {
 
                         for (const [reactorUid, reactionData] of Object.entries(messageData.reactions)) {
                             
-                            if (reactorUid === messageOwner) continue; 
+                            if (reactorUid === messageOwner) continue; // Don't notify self
                             if (!reactorUid) continue;
 
+                            // STRICT THROTTLE: Prevents the "multiple notifications" bug
+                            // Only allows 1 reaction notification per user, per message, every 10 seconds
                             const throttleKey = `throttle_${docId}_${reactorUid}`;
                             if (reactionThrottle.has(throttleKey)) continue;
                             
                             reactionThrottle.add(throttleKey);
                             setTimeout(() => reactionThrottle.delete(throttleKey), 10000); 
 
-                            // Timestamp boundary to prevent reaction spam from older cached DB updates
-                            if (Date.now() - reactionData.timestamp > 120000) continue;
+                            // FIXED: Increased drift tolerance to 24 hours to stop bugs on mobile
+                            if (Date.now() - reactionData.timestamp > 86400000) continue;
+                            if (reactionData.timestamp <= SERVER_START_TIME) continue;
 
+                            // Cache key to permanently log this specific emoji reaction in memory
                             const reactionCacheKey = `reaction_${docId}_${reactorUid}_${reactionData.emoji}`;
                             if (processedMessages.has(reactionCacheKey)) continue;
                             processedMessages.add(reactionCacheKey);
@@ -169,6 +183,7 @@ function startMessageListener() {
                             const chatDocId = chatRef.id;
                             const chatDoc = await chatRef.get();
                             
+                            // Safe fetching of group data
                             const chatData = chatDoc.exists ? chatDoc.data() : {};
                             const isGroup = chatData.isGroup === true;
 
@@ -209,30 +224,35 @@ function startNotificationListener() {
     db.collection('notifications').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
+            // STRICT FIX: Ignore all historical snapshot data during the first 10 seconds
+            if (isBooting) return;
+
             if (change.type === 'added') {
                 const docId = change.doc.id;
-                const notifData = change.doc.data();
-                
-                // BULLETPROOF TIMESTAMP: Combines logic securely 
-                let msgTime = 0;
-                if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-                else if (notifData.timestamp && notifData.timestamp.toMillis) msgTime = notifData.timestamp.toMillis();
-                else if (notifData.timestamp) msgTime = new Date(notifData.timestamp).getTime();
-
-                // Process strictly if event was logged in the last 2 minutes
-                if (!msgTime || Date.now() - msgTime > 120000) return;
-
                 if (processedNotifs.has(docId)) return;
                 processedNotifs.add(docId);
                 setTimeout(() => processedNotifs.delete(docId), 180000); 
 
-                // BULLETPROOF ID CHECKER
-                const targetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId;
-                const senderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender;
+                const notifData = change.doc.data();
+                
+                // BULLETPROOF TIMESTAMP: Uses Firestore creation time if payload timestamp is missing/broken
+                let msgTime = SERVER_START_TIME;
+                if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
+                else if (notifData.timestamp && notifData.timestamp.toMillis) msgTime = notifData.timestamp.toMillis();
+                else if (notifData.timestamp) msgTime = new Date(notifData.timestamp).getTime();
+
+                // FIXED: Increased tolerance to 24 hours to prevent dropped notifications due to client drift
+                if (Date.now() - msgTime > 86400000) return;
+                if (msgTime <= SERVER_START_TIME) return;
+
+                // BULLETPROOF ID CHECKER: Catch fields no matter what they are named in the frontend
+                const targetUid = notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId || notifData.authorId || notifData.postOwnerId || notifData.uid || notifData.user;
+                const senderUid = notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender || notifData.actorId || notifData.byUser;
                 
                 if (!targetUid || targetUid === senderUid) return; 
 
                 try {
+                    // NEW FIX: ALWAYS fetch exact user profile to guarantee Names and PFPs are correct
                     const senderDoc = await db.collection('users').doc(senderUid).get();
                     const senderData = senderDoc.data() || {};
                     const senderName = senderData.name || senderData.username || notifData.senderName || notifData.fromName || "Someone";
@@ -243,33 +263,44 @@ function startNotificationListener() {
                     let title = "New Notification";
                     let body = ""; 
 
+                    // Get whatever text the user sent, checking all possible frontend variables
                     const textContent = notifData.text || notifData.body || notifData.message || notifData.comment || "";
+                    
+                    // SMART WORDING: Detects exact feature based on type, URL, or raw text content
                     const type = (notifData.type || "").toLowerCase();
-                    const linkString = deepLink.toLowerCase();
+                    const linkString = (deepLink || "").toLowerCase();
+                    const textLower = textContent.toLowerCase();
 
                     // --- 1. HANDLE LIKES ---
-                    // Added safety catch properties for "noteId" specifically to catch missing types
-                    if (type.includes('like')) {
+                    if (type.includes('like') || textLower.includes('liked')) {
                         title = `New Like ❤️`;
-                        if (type === 'note_like' || linkString.includes('note') || notifData.noteId) body = `${senderName} liked your Note.`;
-                        else if (type === 'drop_like' || linkString.includes('drop')) body = `${senderName} liked your Drop.`;
-                        else if (type === 'like_moment' || linkString.includes('moment')) body = `${senderName} liked your Moment.`;
+                        if (type.includes('note') || linkString.includes('note') || textLower.includes('note')) body = `${senderName} liked your Note.`;
+                        else if (type.includes('drop') || linkString.includes('drop') || textLower.includes('drop')) body = `${senderName} liked your Drop.`;
+                        else if (type.includes('moment') || linkString.includes('moment') || textLower.includes('moment')) body = `${senderName} liked your Moment.`;
                         else body = `${senderName} liked your post.`;
                     } 
                     // --- 2. HANDLE REPLIES & COMMENTS ---
-                    else if (type.includes('reply') || type.includes('comment')) {
+                    else if (type.includes('reply') || type.includes('comment') || textLower.includes('replied') || textLower.includes('commented')) {
                         title = `New Reply 💬`;
-                        if (type === 'drop_reply' || linkString.includes('drop')) {
+                        if (type.includes('drop') || linkString.includes('drop') || textLower.includes('drop')) {
                              body = textContent ? `${senderName} replied to your Drop: "${textContent}"` : `${senderName} replied to your Drop.`;
-                        } else if (type === 'note_reply' || linkString.includes('note') || notifData.noteId) {
+                        } else if (type.includes('note') || linkString.includes('note') || textLower.includes('note')) {
                              body = textContent ? `${senderName} replied to your Note: "${textContent}"` : `${senderName} replied to your Note.`;
-                        } else if (type === 'reply_moment' || type === 'comment_moment') {
-                             body = textContent ? `${senderName} ${textContent}` : `${senderName} commented on your Moment.`;
+                        } else if (type.includes('moment') || linkString.includes('moment') || textLower.includes('moment')) {
+                             body = textContent ? `${senderName} replied to your Moment: "${textContent}"` : `${senderName} replied to your Moment.`;
                         } else {
                              body = textContent ? `${senderName} commented: "${textContent}"` : `${senderName} commented on your post.`;
                         }
                     } 
-                    // --- 3. FALLBACK ---
+                    // --- 3. HANDLE GENERIC DROPS/NOTES/MOMENTS INTERACTIONS ---
+                    else if (type.includes('drop') || type.includes('note') || type.includes('moment')) {
+                        title = `New Interaction 🔔`;
+                        if (type.includes('drop') || linkString.includes('drop')) body = `${senderName} interacted with your Drop.`;
+                        else if (type.includes('note') || linkString.includes('note')) body = `${senderName} interacted with your Note.`;
+                        else if (type.includes('moment') || linkString.includes('moment')) body = `${senderName} interacted with your Moment.`;
+                        else body = `${senderName} interacted with your post.`;
+                    }
+                    // --- 4. FALLBACK ---
                     else {
                         body = textContent || "Check your activity feed.";
                     }
@@ -293,23 +324,21 @@ function startNotificationListener() {
 function startCallListener() {
     console.log("🎧 Listening for Incoming and Missed Calls...");
 
-    // 1. INCOMING CALLS
+    // 1. INCOMING CALLS (Watches the 'calls' signaling collection)
     db.collection('calls').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
+            
+            if (isBooting) return;
+
             if (change.type === 'added' || change.type === 'modified') {
                 const callData = change.doc.data();
-                if (callData.status !== 'calling') return;
+                if (callData.status !== 'calling') return; // Only notify if currently ringing
 
-                let msgTime = 0;
-                if (change.doc.updateTime) msgTime = change.doc.updateTime.toMillis();
-                else if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
-
-                if (!msgTime || Date.now() - msgTime > 60000) return; // Ignore calls ringing longer than 1 min
-
-                const targetUid = change.doc.id; 
+                const targetUid = change.doc.id; // Receiver's UID is the Document ID
                 const callerUid = callData.callerId;
                 if (!targetUid || !callerUid) return;
 
+                // Throttle calls to prevent ringing them 50 times during ICE candidate exchange
                 const throttleKey = `call_${targetUid}_${callerUid}`;
                 if (processedNotifs.has(throttleKey)) return;
                 processedNotifs.add(throttleKey);
@@ -328,7 +357,7 @@ function startCallListener() {
                     const deepLink = `https://www.goorac.biz/calls.html`;
 
                     await beamsClient.publishToInterests([targetUid], {
-                        web: { notification: { title, body, icon: callerPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 60 },
+                        web: { notification: { title, body, icon: callerPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 60 }, // Expires quickly
                         fcm: { notification: { title, body, icon: callerPhoto }, data: { click_action: deepLink }, priority: "high" },
                         apns: { aps: { alert: { title, body }, "thread-id": "calls" }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
                     });
@@ -338,18 +367,19 @@ function startCallListener() {
         });
     }, (error) => { console.error("❌ Calls listener error:", error); });
 
-    // 2. MISSED CALLS
+    // 2. MISSED CALLS (Watches the 'call_logs' collection)
     db.collection('call_logs').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             
-            let msgTime = 0;
+            let msgTime = SERVER_START_TIME;
             if (change.doc.createTime) msgTime = change.doc.createTime.toMillis();
 
-            if (!msgTime || Date.now() - msgTime > 120000) return;
+            // STRICT FIX: Ignore historical data on boot, BUT allow missed calls from the last 10 minutes
+            if (isBooting && (Date.now() - msgTime > 600000)) return;
 
             if (change.type === 'added') {
                 const logData = change.doc.data();
-                if (logData.status !== 'missed') return; 
+                if (logData.status !== 'missed') return; // Only notify if missed
 
                 const targetUid = logData.receiverId;
                 const callerUid = logData.callerId;
@@ -388,7 +418,7 @@ function startCallListener() {
 function startPushListener() {
     startMessageListener();
     startNotificationListener();
-    startCallListener(); 
+    startCallListener(); // <-- Starts the new Call Listeners
 }
 
 // Render and other services provide the PORT automatically
@@ -400,4 +430,5 @@ app.listen(port, () => {
   startPushListener();
 });
 
+// Require and start the external server logic
 require('./server.js');
