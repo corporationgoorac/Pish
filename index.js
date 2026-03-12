@@ -5,9 +5,7 @@ const PushNotifications = require('@pusher/push-notifications-server');
 
 const app = express();
 
-// --- THE ULTIMATE FIX: TRUE SERVER TIME ---
-// By setting this to Date.now(), we guarantee the server NEVER looks at historical 
-// messages when it restarts. This completely eliminates the "spam on restart" bug.
+// --- THE ULTIMATE ANTI-SPAM CLOCK ---
 const SERVER_START_TIME = Date.now(); 
 
 const processedMessages = new Set();
@@ -49,20 +47,8 @@ const beamsClient = new PushNotifications({
 });
 
 // ============================================================================
-// SAFETY NET: RESTORED FETCH ENDPOINT
+// /send-push API ROUTE COMPLETELY REMOVED AS REQUESTED
 // ============================================================================
-app.post('/send-push', (req, res) => {
-    const { targetUid, senderUid, title, body, icon, click_action } = req.body;
-    const deepLink = click_action || "https://www.goorac.biz";
-  
-    res.status(200).json({ success: true, message: "Push accepted via API route" });
-  
-    beamsClient.publishToInterests([targetUid], {
-      web: { notification: { title, body, icon, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
-      fcm: { notification: { title, body, icon }, data: { click_action: deepLink }, priority: "high" },
-      apns: { aps: { alert: { title, body }, "thread-id": senderUid || "api-push" }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
-    }).catch(e => console.error('API Push Error:', e));
-});
 
 // ============================================================================
 // LISTENER 1: CHATS, GROUP CHATS, DIRECT REPLIES, AND REACTIONS
@@ -77,20 +63,20 @@ function startMessageListener() {
             const docId = change.doc.id;
             
             // -----------------------------------------------------------------
-            // A. STRICTLY NEW MESSAGES (No 'modified' allowed here)
+            // A. STRICTLY NEW MESSAGES
             // -----------------------------------------------------------------
             if (change.type === 'added') {
                 
-                // ULTIMATE SPAM FIX: Use Google's absolute Server Time. 
-                // Ignore any message that was created before the server woke up.
                 const msgCreateTime = change.doc.createTime ? change.doc.createTime.toMillis() : Date.now();
+                
+                // STRICT ANTI-SPAM: If the message is older than 60 seconds, ignore it instantly. 
+                if (Date.now() - msgCreateTime > 60000) return; 
                 if (msgCreateTime <= SERVER_START_TIME) return; 
                 
                 if (processedMessages.has(docId)) return;
                 processedMessages.add(docId);
-                setTimeout(() => processedMessages.delete(docId), 180000); 
+                setTimeout(() => processedMessages.delete(docId), 86400000); // 24-hour permanent cache lock
 
-                // Race Condition Delay (Fixes User A getting User B's notification)
                 setTimeout(async () => {
                     try {
                         const senderUid = String(messageData.sender || "").trim();
@@ -115,6 +101,8 @@ function startMessageListener() {
                             }
                         }
 
+                        // GUARANTEE NO DOUBLE SENDING TO THE SAME USER
+                        targetUids = [...new Set(targetUids.filter(uid => String(uid).trim() !== senderUid))];
                         if (targetUids.length === 0) return; 
                         
                         const senderDoc = await db.collection('users').doc(senderUid).get();
@@ -138,32 +126,30 @@ function startMessageListener() {
                             : `https://www.goorac.biz/chat.html?user=${senderUsername}`;
 
                         targetUids.forEach(async (targetUid) => {
-                            const targetDoc = await db.collection('users').doc(targetUid).get();
-                            const targetActiveChat = targetDoc.data()?.activeChat;
-                            if (targetActiveChat === senderUid || targetActiveChat === senderUsername || targetActiveChat === chatDocId) {
-                                console.log(`🔇 Muting: ${targetUid} is actively in this chat.`);
-                                return;
-                            }
+                            try {
+                                const targetDoc = await db.collection('users').doc(targetUid).get();
+                                const targetActiveChat = targetDoc.data()?.activeChat;
+                                if (targetActiveChat === senderUid || targetActiveChat === senderUsername || targetActiveChat === chatDocId) {
+                                    console.log(`🔇 Muting: ${targetUid} is actively in this chat.`);
+                                    return;
+                                }
 
-                            await beamsClient.publishToInterests([targetUid], {
-                                web: { notification: { title: senderName, body: bodyText, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
-                                fcm: { notification: { title: senderName, body: bodyText, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
-                                apns: { aps: { alert: { title: senderName, body: bodyText }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
-                            });
+                                await beamsClient.publishToInterests([targetUid], {
+                                    web: { notification: { title: senderName, body: bodyText, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: false }, time_to_live: 3600 },
+                                    fcm: { notification: { title: senderName, body: bodyText, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
+                                    apns: { aps: { alert: { title: senderName, body: bodyText }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
+                                });
+                            } catch(e) { console.error("Push Error", e); }
                         });
                     } catch (error) { console.error("❌ Message Push Error:", error); }
-                }, 1500); // <-- 1.5s delay protects User B targeting
+                }, 1500); 
             }
 
             // -----------------------------------------------------------------
-            // B. STRICTLY MESSAGE REACTIONS (No 'added' events allowed here)
+            // B. STRICTLY MESSAGE REACTIONS
             // -----------------------------------------------------------------
             if (change.type === 'modified' && messageData.reactions) {
                 try {
-                    // SPAM FIX: Only process reactions if the document modification happened AFTER server boot
-                    const msgUpdateTime = change.doc.updateTime ? change.doc.updateTime.toMillis() : Date.now();
-                    if (msgUpdateTime <= SERVER_START_TIME) return;
-
                     const messageOwner = String(messageData.sender || "").trim(); 
                     if (!messageOwner) return;
 
@@ -172,13 +158,15 @@ function startMessageListener() {
                         const safeReactorUid = String(reactorUid).trim();
                         if (safeReactorUid === messageOwner) continue; 
 
-                        // TRUE CACHE LOCK: Caches this specific reaction for 24 HOURS in server memory.
-                        // Even if the message is updated 100 times for read receipts, it cannot send the reaction twice.
+                        // STRICT ANTI-SPAM: Kills old reactions that trigger during a read-receipt modified event!
+                        if (!reactionData.timestamp) continue;
+                        if (Date.now() - reactionData.timestamp > 60000) continue; 
+
                         const reactionCacheKey = `reaction_${docId}_${safeReactorUid}_${reactionData.emoji}`;
                         if (processedMessages.has(reactionCacheKey)) continue;
                         
                         processedMessages.add(reactionCacheKey);
-                        setTimeout(() => processedMessages.delete(reactionCacheKey), 86400000); // 24-hour lock
+                        setTimeout(() => processedMessages.delete(reactionCacheKey), 86400000); // 24-hour cache lock
 
                         const chatRef = change.doc.ref.parent.parent;
                         const chatDocId = chatRef.id;
@@ -229,13 +217,18 @@ function startNotificationListener() {
                 const notifData = change.doc.data();
                 const docId = change.doc.id;
                 
-                // SPAM FIX: Absolutely block any notification that was created before the server booted
-                const msgCreateTime = change.doc.createTime ? change.doc.createTime.toMillis() : Date.now();
+                let msgCreateTime = SERVER_START_TIME;
+                if (change.doc.createTime) msgCreateTime = change.doc.createTime.toMillis();
+                else if (notifData.timestamp && notifData.timestamp.toMillis) msgCreateTime = notifData.timestamp.toMillis();
+                else if (notifData.timestamp) msgCreateTime = new Date(notifData.timestamp).getTime();
+
+                // STRICT ANTI-SPAM: Must be within 60 seconds
+                if (Date.now() - msgCreateTime > 60000) return;
                 if (msgCreateTime <= SERVER_START_TIME) return;
 
                 if (processedNotifs.has(docId)) return;
                 processedNotifs.add(docId);
-                setTimeout(() => processedNotifs.delete(docId), 180000); 
+                setTimeout(() => processedNotifs.delete(docId), 86400000); // 24-hour cache lock
 
                 const targetUid = String(notifData.toUid || notifData.targetUid || notifData.receiverId || notifData.ownerId).trim();
                 const senderUid = String(notifData.fromUid || notifData.senderUid || notifData.userId || notifData.sender).trim();
@@ -297,6 +290,8 @@ function startCallListener() {
                 if (callData.status !== 'calling') return; 
 
                 const msgUpdateTime = change.doc.updateTime ? change.doc.updateTime.toMillis() : Date.now();
+                // STRICT ANTI-SPAM: Must be within 60 seconds
+                if (Date.now() - msgUpdateTime > 60000) return;
                 if (msgUpdateTime <= SERVER_START_TIME) return;
 
                 const targetUid = String(change.doc.id).trim(); 
@@ -337,6 +332,8 @@ function startCallListener() {
                 if (logData.status !== 'missed') return; 
 
                 const msgCreateTime = change.doc.createTime ? change.doc.createTime.toMillis() : Date.now();
+                // STRICT ANTI-SPAM: Must be within 60 seconds
+                if (Date.now() - msgCreateTime > 60000) return;
                 if (msgCreateTime <= SERVER_START_TIME) return;
 
                 const targetUid = String(logData.receiverId).trim();
@@ -346,7 +343,7 @@ function startCallListener() {
                 const docId = change.doc.id;
                 if (processedNotifs.has(docId)) return;
                 processedNotifs.add(docId);
-                setTimeout(() => processedNotifs.delete(docId), 180000);
+                setTimeout(() => processedNotifs.delete(docId), 86400000);
 
                 try {
                     const callerDoc = await db.collection('users').doc(callerUid).get();
