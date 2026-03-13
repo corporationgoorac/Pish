@@ -1,14 +1,15 @@
 /**
  * ============================================================================
  * 🚀 GOORAC QUANTUM BITES - ENTERPRISE BACKEND ENGINE
- * Version: 7.0.0 (Ultimate Production Release)
- * Architecture: Pool-Based SWR Caching, Staggered Anti-Ban Scraping, NLP Engine
+ * Version: 8.0.0 (Advanced NLP & ML Auto-Refill Release)
+ * Architecture: Pool-Based SWR Caching, Staggered Anti-Ban Scraping, Global ML
  * ============================================================================
  */
 
 const ytSearch = require('yt-search');
 const crypto = require('crypto');
 const EventEmitter = require('events');
+const admin = require('firebase-admin'); // Connected to your existing Firebase instance
 
 // ============================================================================
 // ⚙️ 1. ENTERPRISE CONFIGURATION
@@ -31,56 +32,22 @@ const CONFIG = {
         MAX_DURATION_SEC: 66,            // Strict Shorts length enforcement
         ALGO_BATCH_SIZE: 15,             // Optimal payload size for infinite scroll UI
         SEARCH_BATCH_SIZE: 18,           // First page top results for Discover grid
+    },
+    ML: {
+        REFILL_INTERVAL: 30 * 60 * 1000, // Auto-scan network & refill pools every 30 mins
     }
 };
 
 // ============================================================================
-// 🇮🇳 2. MASSIVE TAMIL & VIRAL KEYWORD MATRIX (250+ DEEP TRENDS)
+// 🇮🇳 2. MASSIVE TAMIL & VIRAL KEYWORD MATRIX (SEED DATA)
 // ============================================================================
 const TREND_MATRIX = {
-    STARS: [
-        "thalapathy vijay", "thala ajith", "rajinikanth superstar", "kamal haasan", 
-        "dhanush", "str simbu", "suriya", "sivakarthikeyan", "karthi", "chiyaan vikram", 
-        "vijay sethupathi", "jayam ravi", "fahaad faasil", "nayanthara", "trisha krishnan", 
-        "samantha ruth prabhu", "keerthy suresh", "rashmika mandanna", "sreeleela"
-    ],
-    MUSIC: [
-        "anirudh ravichander live", "anirudh bgm", "ar rahman live", "arr bgm", 
-        "yuvan shankar raja concert", "yuvan bgm", "harris jayaraj hits", 
-        "santhosh narayanan", "gvp bgm", "thaman bgm", "tamil concert vlog"
-    ],
-    MOVIES: [
-        "leo movie", "jailer movie", "vidaamuyarchi", "goat movie vijay", "kanguva suriya", 
-        "indian 2", "thangalaan", "viduthalai", "captain miller", "amaran movie", 
-        "raayan dhanush", "mankatha", "ghilli re release", "billa", "vikram movie", 
-        "kaithi", "master movie", "theri", "thuppakki", "padayappa", "baasha mass"
-    ],
-    COMEDY: [
-        "vadivelu comedy", "vadivelu template", "goundamani senthil", "santhanam comedy", 
-        "vivek comedy message", "yogi babu comedy", "soori comedy", "tamil memes", 
-        "tamil troll", "micset", "jump cuts", "eruma saani", "parithabangal", 
-        "gopi sudhakar", "madras central", "blacksheep tamil", "temple monkeys", 
-        "nakkalites", "behindwoods troll", "galatta comedy", "cringe shorts tamil"
-    ],
-    STATUS: [
-        "tamil whatsapp status", "tamil bgm status", "tamil love status", "tamil sad status", 
-        "tamil mass status", "tamil attitude status", "tamil motivational status", 
-        "tamil friendship status", "tamil lyric video", "tamil 4k status", 
-        "tamil fullscreen status", "tamil lo-fi status", "vijay mass edit 4k", 
-        "ajith mass edit 4k", "anirudh status video"
-    ],
-    CREATORS: [
-        "peppa foodie", "irfan view tamil", "madan gowri shorts", "ttv gaming", 
-        "tamil gaming shorts", "cherry vlogs", "tamil cinema update", 
-        "kollywood news latest", "tamil speech", "tamil interview viral", 
-        "blue sattai roast", "tamil tech shorts", "tamil review"
-    ],
-    MODIFIERS: [
-        "viral", "trending", "must watch", "blow up", "million views", "banger",
-        "new", "2026", "update", "latest", "today", "just dropped",
-        "#shorts", "status", "edit", "bgm", "part 1", "4k edit",
-        "lol", "wow", "best", "funny", "crazy", "epic", "mind blowing"
-    ]
+    STARS: ["thalapathy vijay", "thala ajith", "rajinikanth", "kamal haasan", "dhanush", "suriya", "sivakarthikeyan", "karthi"],
+    MUSIC: ["anirudh bgm", "ar rahman live", "yuvan bgm", "harris jayaraj", "santhosh narayanan"],
+    MOVIES: ["leo movie", "jailer movie", "vidaamuyarchi", "goat movie", "kanguva", "amaran", "raayan"],
+    COMEDY: ["vadivelu comedy", "santhanam comedy", "yogi babu comedy", "tamil memes", "gopi sudhakar", "parithabangal"],
+    STATUS: ["tamil whatsapp status", "tamil bgm status", "tamil love status", "tamil sad status", "tamil mass edit 4k"],
+    MODIFIERS: ["viral", "trending", "must watch", "blow up", "million views", "banger", "new", "2026", "update", "latest", "just dropped", "#shorts", "status", "edit", "part 1", "4k edit", "epic"]
 };
 
 // ============================================================================
@@ -106,17 +73,46 @@ class Logger {
 }
 
 // ============================================================================
-// 🧬 4. NATURAL LANGUAGE PROCESSING & DATA ENGINE
+// 🧬 4. ADVANCED NATURAL LANGUAGE PROCESSING (SEMANTIC ENGINE)
 // ============================================================================
 class NLPProcessor {
+    // Advanced Neural Dictionary: Maps highly specific words to global core concepts
+    static semanticSynonyms = {
+        "dhoni": "cricket", "kohli": "cricket", "ipl": "cricket", "rohit": "cricket", "bcci": "cricket", "csk": "cricket",
+        "vaayavmoodi": "song", "anirudh": "song", "arr": "song", "bgm": "song", "music": "song", "kadalalle": "song", "melody": "song",
+        "red": "color", "read": "color", "black": "color", "blue": "color", "white": "color", "green": "color", "yellow": "color",
+        "flower": "nature", "rose": "flower", "tree": "nature", "sunset": "nature", "rain": "nature", "waterfall": "nature",
+        "coding": "tech", "developer": "tech", "javascript": "tech", "python": "tech", "ai": "tech", "software": "tech",
+        "thalapathy": "actor", "vijay": "actor", "thala": "actor", "ajith": "actor", "cinema": "movies", "film": "movies",
+        "biryani": "food", "chicken": "food", "cooking": "food", "recipe": "food", "street food": "food"
+    };
+
     static extractHashtags(text) {
         if (!text || typeof text !== 'string') return [];
-        // Matches Unicode letters for Tamil hashtag extraction
-        const regex = /#[\p{L}\p{N}_]+/gu; 
-        const matches = text.match(regex);
-        if (!matches) return [];
-        const cleanTags = matches.map(tag => tag.replace('#', '').toLowerCase().trim());
-        return [...new Set(cleanTags)];
+        const cleanStr = text.toLowerCase();
+        let extracted = new Set();
+        
+        // Match explicit hashtags first
+        const hashMatches = cleanStr.match(/#[\p{L}\p{N}_]+/gu); 
+        if (hashMatches) hashMatches.forEach(t => extracted.add(t.replace('#', '').trim()));
+        
+        // Deep Semantic Scanning
+        const words = cleanStr.replace(/[^\w\s]/g, '').split(/\s+/);
+        words.forEach(word => {
+            if (word.length > 2) {
+                if (word.length > 4) extracted.add(word); // Keep strong unique words
+                
+                // If the word matches our NLP Dictionary, map it to the core concept
+                if (this.semanticSynonyms[word]) {
+                    extracted.add(this.semanticSynonyms[word]);
+                    // Double linkage (e.g. rose -> flower -> nature)
+                    if (this.semanticSynonyms[this.semanticSynonyms[word]]) {
+                        extracted.add(this.semanticSynonyms[this.semanticSynonyms[word]]);
+                    }
+                }
+            }
+        });
+        return Array.from(extracted).slice(0, 8); // Max 8 tags per video to save RAM
     }
 
     static sanitizeTitle(title) {
@@ -131,11 +127,9 @@ class NLPProcessor {
 class EngagementEngine {
     static simulate(actualViews) {
         const baseViews = actualViews > 1000 ? actualViews : Math.floor(Math.random() * 900000) + 15000;
-        
-        // Bell-Curve Logic
-        const likeRatio = (Math.random() * 0.05) + 0.03;      // 3% to 8% likes
-        const commentRatio = (Math.random() * 0.004) + 0.001; // 0.1% to 0.5% comments
-        const shareRatio = (Math.random() * 0.015) + 0.005;   // 0.5% to 2% shares
+        const likeRatio = (Math.random() * 0.05) + 0.03;      
+        const commentRatio = (Math.random() * 0.004) + 0.001; 
+        const shareRatio = (Math.random() * 0.015) + 0.005;   
 
         return {
             views: baseViews,
@@ -150,8 +144,6 @@ class EngagementEngine {
 // 🎯 6. RELEVANCY, SHUFFLING & DEDUPLICATION ALGORITHMS
 // ============================================================================
 class AlgorithmEngine {
-    
-    // Cryptographic perfect shuffle (Unbiased)
     static cryptoShuffle(array) {
         let arr = [...array];
         for (let i = arr.length - 1; i > 0; i--) {
@@ -162,98 +154,87 @@ class AlgorithmEngine {
         return arr;
     }
 
-    // O(1) Deduplication using Map to guarantee 1 video never plays twice
     static enforceUniqueness(videos) {
         const map = new Map();
         for (const v of videos) {
-            if (v && v.videoId && !map.has(v.videoId)) {
-                map.set(v.videoId, v);
-            }
+            if (v && v.videoId && !map.has(v.videoId)) map.set(v.videoId, v);
         }
         return Array.from(map.values());
     }
 
-    // Mathematical exact-match ranking for Search Mode (Top Results Fix)
     static rankSearchRelevancy(videos, exactQuery) {
         const queryTokens = exactQuery.toLowerCase().replace('#shorts', '').trim().split(/\s+/);
-
         return videos.map(video => {
             let score = 0;
             const title = video.title ? video.title.toLowerCase() : "";
-
             const views = video.views || 0;
+            
             score += Math.log10(views + 1) * 20; 
-
             let matchCount = 0;
             queryTokens.forEach(word => { if (title.includes(word)) matchCount++; });
             score += (matchCount * 150); 
-
             if (title.includes('#shorts') || title.includes('shorts')) score += 80;
-
             if (video.ago) {
                 if (video.ago.includes('minute')) score += 60;
                 if (video.ago.includes('hour')) score += 40;
                 if (video.ago.includes('day')) score += 20;
             }
-
             return { ...video, relevancyScore: score };
         }).sort((a, b) => b.relevancyScore - a.relevancyScore); 
     }
 
-    // Generates completely random intent queries
-    static buildTamilQueries() {
+    // Dynamic Query Builder based on ML Input
+    static buildDynamicQueries(baseTopic) {
         const queries = [];
+        const isTamil = baseTopic.includes('tamil');
+        const mods = TREND_MATRIX.MODIFIERS;
         
-        const q1Star = TREND_MATRIX.STARS[Math.floor(Math.random() * TREND_MATRIX.STARS.length)];
-        const q1Mod = TREND_MATRIX.MODIFIERS[Math.floor(Math.random() * TREND_MATRIX.MODIFIERS.length)];
-        queries.push(`${q1Star} shorts ${q1Mod}`);
+        // 1. Exact Topic + Trending
+        queries.push(`${baseTopic} shorts ${mods[Math.floor(Math.random() * mods.length)]}`);
+        
+        // 2. Synonymous Search (If NLP finds a match)
+        let mapped = NLPProcessor.semanticSynonyms[baseTopic.toLowerCase()];
+        if (mapped) queries.push(`${mapped} shorts ${mods[Math.floor(Math.random() * mods.length)]}`);
+        else queries.push(`${baseTopic} shorts viral`);
 
-        const q2Meme = TREND_MATRIX.COMEDY[Math.floor(Math.random() * TREND_MATRIX.COMEDY.length)];
-        queries.push(`${q2Meme} shorts`);
-
-        const q3Status = TREND_MATRIX.STATUS[Math.floor(Math.random() * TREND_MATRIX.STATUS.length)];
-        queries.push(`${q3Status}`);
-
-        const wildcardCats = [TREND_MATRIX.MUSIC, TREND_MATRIX.MOVIES, TREND_MATRIX.CREATORS];
-        const selectedCat = wildcardCats[Math.floor(Math.random() * wildcardCats.length)];
-        const q4Wild = selectedCat[Math.floor(Math.random() * selectedCat.length)];
-        queries.push(`${q4Wild} shorts viral`);
+        // 3. Fallback Mix
+        if (isTamil) {
+            queries.push(`${TREND_MATRIX.STARS[Math.floor(Math.random() * TREND_MATRIX.STARS.length)]} shorts viral`);
+        }
 
         return queries;
     }
 }
 
 // ============================================================================
-// 🧠 7. ENTERPRISE MASSIVE-POOL CACHE ENGINE
+// 🧠 7. ENTERPRISE CACHE & GLOBAL DEDUPLICATION HISTORY
 // ============================================================================
 const BackgroundEventBus = new EventEmitter();
 
 class EnterpriseCache {
     constructor() {
         this.store = new Map();
+        this.globalSeenHistory = new Set(); // 🚀 STRICT PREVIOUS VIDEO BAN LIST
         setInterval(() => this.sweep(), CONFIG.CACHE.CLEANUP_INTERVAL);
     }
 
-    generateKey(baseTopic, type) {
-        return `${type}_${baseTopic.toLowerCase().trim()}`;
-    }
+    generateKey(baseTopic, type) { return `${type}_${baseTopic.toLowerCase().trim()}`; }
 
     get(key) {
         const record = this.store.get(key);
         if (!record) return { data: null, isStale: false };
 
         const age = Date.now() - record.timestamp;
-        
         if (age > CONFIG.CACHE.HARD_EXPIRY_MS) {
             this.store.delete(key);
             return { data: null, isStale: false };
         }
-
-        const isStale = age > CONFIG.CACHE.TTL_MS;
-        return { data: record.data, isStale };
+        return { data: record.data, isStale: age > CONFIG.CACHE.TTL_MS };
     }
 
     set(key, data) {
+        // Automatically inject all new videos into the permanent Global History
+        data.forEach(v => this.globalSeenHistory.add(v.videoId));
         this.store.set(key, { data, timestamp: Date.now() });
     }
 
@@ -266,7 +247,7 @@ class EnterpriseCache {
                 swept++;
             }
         }
-        if (swept > 0) Logger.info(`🗑️ Swept ${swept} dead cache pools.`);
+        if (swept > 0) Logger.info(`🗑️ Swept ${swept} dead cache pools. Global History Size: ${this.globalSeenHistory.size}`);
     }
 }
 
@@ -276,17 +257,11 @@ const GlobalCache = new EnterpriseCache();
 // 🛡️ 8. CIRCUIT BREAKER & ANTI-BAN SCRAPER
 // ============================================================================
 class ScraperService {
-    constructor() {
-        this.failures = 0;
-        this.breakerTrippedUntil = 0;
-    }
+    constructor() { this.failures = 0; this.breakerTrippedUntil = 0; }
 
     isBreakerOpen() {
         if (this.failures >= CONFIG.SCRAPER.CIRCUIT_BREAKER_FAILURES) {
-            if (Date.now() > this.breakerTrippedUntil) {
-                this.failures = 0; 
-                return false;
-            }
+            if (Date.now() > this.breakerTrippedUntil) { this.failures = 0; return false; }
             return true;
         }
         return false;
@@ -302,19 +277,16 @@ class ScraperService {
 
     async safeSearch(query, attempt = 1) {
         if (this.isBreakerOpen()) throw new Error("CIRCUIT_BREAKER_OPEN");
-
         try {
             const result = await Promise.race([
                 ytSearch(query),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), CONFIG.SCRAPER.TIMEOUT_MS))
             ]);
-            
             this.failures = 0; 
             return result.videos || [];
-
         } catch (error) {
             if (error.message === 'TIMEOUT' && attempt <= CONFIG.SCRAPER.MAX_RETRIES) {
-                await new Promise(res => setTimeout(res, 600 * attempt)); // Backoff
+                await new Promise(res => setTimeout(res, 600 * attempt)); 
                 return this.safeSearch(query, attempt + 1);
             }
             this.recordFailure();
@@ -326,45 +298,94 @@ class ScraperService {
 const CoreScraper = new ScraperService();
 
 // ============================================================================
-// 👻 9. BACKGROUND WORKERS (SWR & POOL BUILDING)
+// 🌐 9. MACHINE LEARNING GLOBAL INTEREST AGGREGATOR
 // ============================================================================
+class GlobalMachineLearningEngine {
+    static async analyzeNetworkAndRefill() {
+        if (!admin.apps.length) return; // Abort if Firebase isn't initialized yet
+        Logger.info("🤖 Starting ML Global Network Analysis...");
 
-// Worker: Rebuilds the Algo Pool silently
+        try {
+            const db = admin.firestore();
+            const usersSnap = await db.collection('users').get();
+            let networkScores = {};
+
+            // 1. Analyze every single user's dataset
+            usersSnap.forEach(doc => {
+                const data = doc.data();
+                if (data.interests) {
+                    for (let [topic, score] of Object.entries(data.interests)) {
+                        
+                        // Pass through NLP Semantic Engine to normalize words
+                        let mappedTopic = topic.toLowerCase().trim();
+                        for (const [key, category] of Object.entries(NLPProcessor.semanticSynonyms)) {
+                            if (mappedTopic.includes(key)) { mappedTopic = category; break; }
+                        }
+                        
+                        networkScores[mappedTopic] = (networkScores[mappedTopic] || 0) + score;
+                    }
+                }
+            });
+
+            // 2. Rank the absolute top trends mathematically
+            const topGlobalInterests = Object.entries(networkScores)
+                .sort((a, b) => b[1] - a[1])
+                .map(e => e[0])
+                .slice(0, 10); // Take the top 10 most viral network-wide concepts
+
+            if (topGlobalInterests.length === 0) topGlobalInterests.push("tamil", "comedy", "tech");
+
+            Logger.info(`🔥 Network Top Interests Ranked: [${topGlobalInterests.join(', ')}]`);
+
+            // 3. Automatically Pre-Warm / Refill the Server Caches with NEW videos only
+            for (const interest of topGlobalInterests) {
+                const cacheKey = GlobalCache.generateKey(interest, 'ALGO_POOL');
+                BackgroundEventBus.emit('refresh_algo_pool', { baseTopic: interest, cacheKey });
+                await new Promise(r => setTimeout(r, 2000)); // Stagger massive background work
+            }
+
+        } catch (error) {
+            Logger.error("ML Network Analysis Failed", error);
+        }
+    }
+}
+
+// Start the ML Auto-Refill Job in the background
+setTimeout(() => GlobalMachineLearningEngine.analyzeNetworkAndRefill(), 15000); // 15s after boot
+setInterval(() => GlobalMachineLearningEngine.analyzeNetworkAndRefill(), CONFIG.ML.REFILL_INTERVAL);
+
+
+// ============================================================================
+// 👻 10. BACKGROUND WORKERS (SWR & POOL BUILDING)
+// ============================================================================
 BackgroundEventBus.on('refresh_algo_pool', async ({ baseTopic, cacheKey }) => {
     try {
-        Logger.info(`[BACKGROUND] Replenishing Algo Pool for: ${baseTopic}`);
-        const isTamil = baseTopic.includes('tamil');
-        const queries = isTamil ? AlgorithmEngine.buildTamilQueries() : [`${baseTopic} shorts viral`, `${baseTopic} shorts new`];
-        
+        Logger.info(`[BACKGROUND] Replenishing Pool for: ${baseTopic}`);
+        const queries = AlgorithmEngine.buildDynamicQueries(baseTopic);
         let newVideos = [];
         
-        // 🚀 ANTI-BAN: Sequential Staggered Fetching
         for (const query of queries.slice(0, 3)) {
             const vids = await CoreScraper.safeSearch(query);
             newVideos.push(...vids.map(v => ({ ...v, queriedCategory: baseTopic })));
-            await new Promise(r => setTimeout(r, CONFIG.SCRAPER.STAGGER_DELAY_MS)); // Crucial delay
+            await new Promise(r => setTimeout(r, CONFIG.SCRAPER.STAGGER_DELAY_MS));
         }
 
-        // 🚀 FIXED: Support YouTube 0-second shorts bug
-        const validShorts = newVideos.filter(v => (v.seconds || 0) <= CONFIG.FEED.MAX_DURATION_SEC);
+        // 🚀 NO PREVIOUS VIDEO FIX: Filter out anything in GlobalSeenHistory
+        const validShorts = newVideos.filter(v => 
+            (v.seconds || 0) <= CONFIG.FEED.MAX_DURATION_SEC && 
+            !GlobalCache.globalSeenHistory.has(v.videoId)
+        );
         
-        // Merge with existing pool & deduplicate
         const { data: existingPool } = GlobalCache.get(cacheKey);
         const combinedPool = existingPool ? [...existingPool, ...validShorts] : validShorts;
-        
         const uniquePool = AlgorithmEngine.enforceUniqueness(combinedPool);
-        
-        // Memory safety: Cap pool size
         const finalPool = uniquePool.slice(0, CONFIG.CACHE.MAX_POOL_SIZE);
         
         GlobalCache.set(cacheKey, finalPool);
-        Logger.info(`[BACKGROUND] Pool updated. Total unique videos in RAM: ${finalPool.length}`);
-    } catch (e) {
-        // Silent fail
-    }
+        Logger.info(`[BACKGROUND] Pool updated. New unique videos found: ${validShorts.length}`);
+    } catch (e) {}
 });
 
-// Worker: Rebuilds exact search cache
 BackgroundEventBus.on('refresh_search_cache', async ({ searchStr, exactQuery, cacheKey }) => {
     try {
         const rawVideos = await CoreScraper.safeSearch(searchStr);
@@ -378,13 +399,12 @@ BackgroundEventBus.on('refresh_search_cache', async ({ searchStr, exactQuery, ca
 });
 
 // ============================================================================
-// 🚀 10. MAIN EXPRESS ROUTER CONTROLLER
+// 🚀 11. MAIN EXPRESS ROUTER CONTROLLER
 // ============================================================================
 module.exports = function(app) {
 
     app.get('/api/reels', async (req, res) => {
         const requestStartTime = Date.now();
-        
         const isSearchMode = req.query.search === 'true';
         const rawTopics = req.query.topic || "tamil"; 
         
@@ -416,49 +436,41 @@ module.exports = function(app) {
                     if (finalFeed.length > 0) GlobalCache.set(cacheKey, finalFeed);
                 }
 
-                // 💡 FIX ADDED HERE: Shuffle search results so users don't see the exact same batch on reload
-                finalFeed = AlgorithmEngine.cryptoShuffle(finalFeed);
+                finalFeed = AlgorithmEngine.cryptoShuffle(finalFeed).slice(0, CONFIG.FEED.SEARCH_BATCH_SIZE);
 
-                finalFeed = finalFeed.slice(0, CONFIG.FEED.SEARCH_BATCH_SIZE);
-
-            } 
-            else {
+            } else {
                 // ================================================================
                 // 🧠 MODE B: MASSIVE POOL ALGORITHM FEED
                 // ================================================================
-                // Use the base topics as the cache key.
                 const baseTopicString = rawTopics.split(',').map(t => t.trim()).join('_');
                 const cacheKey = GlobalCache.generateKey(baseTopicString, 'ALGO_POOL');
                 
                 const { data: poolData, isStale } = GlobalCache.get(cacheKey);
 
                 if (poolData && poolData.length >= CONFIG.FEED.ALGO_BATCH_SIZE) {
-                    // ⚡ ULTRA FAST PATH: Instant 1ms response from RAM pool
-                    // Shuffle the massive pool and slice a batch so it's different every time
                     finalFeed = AlgorithmEngine.cryptoShuffle(poolData).slice(0, CONFIG.FEED.ALGO_BATCH_SIZE);
-                    
                     if (isStale && !CoreScraper.isBreakerOpen()) {
                         BackgroundEventBus.emit('refresh_algo_pool', { baseTopic: rawTopics, cacheKey });
                     }
                 } else {
-                    // 🧊 COLD BOOT: Pool is empty, build it manually right now
                     Logger.warn(`Cold Boot: Building initial Algo Pool for ${baseTopicString}`);
-                    
-                    const isTamil = rawTopics.toLowerCase().includes('tamil');
-                    const queries = isTamil ? AlgorithmEngine.buildTamilQueries() : [`${rawTopics} shorts viral`, `${rawTopics} shorts new`];
-                    
+                    const queries = AlgorithmEngine.buildDynamicQueries(rawTopics);
                     let newVideos = [];
+                    
                     for (const query of queries.slice(0, 3)) {
                         const vids = await CoreScraper.safeSearch(query);
                         newVideos.push(...vids.map(v => ({ ...v, queriedCategory: rawTopics })));
-                        await new Promise(r => setTimeout(r, CONFIG.SCRAPER.STAGGER_DELAY_MS)); // Prevent IP ban
+                        await new Promise(r => setTimeout(r, CONFIG.SCRAPER.STAGGER_DELAY_MS));
                     }
 
-                    const validShorts = newVideos.filter(v => (v.seconds || 0) <= CONFIG.FEED.MAX_DURATION_SEC);
+                    // Strict filter against global seen history
+                    const validShorts = newVideos.filter(v => 
+                        (v.seconds || 0) <= CONFIG.FEED.MAX_DURATION_SEC && 
+                        !GlobalCache.globalSeenHistory.has(v.videoId)
+                    );
                     const uniquePool = AlgorithmEngine.enforceUniqueness(validShorts);
                     
                     if (uniquePool.length > 0) GlobalCache.set(cacheKey, uniquePool);
-
                     finalFeed = AlgorithmEngine.cryptoShuffle(uniquePool).slice(0, CONFIG.FEED.ALGO_BATCH_SIZE);
                 }
             }
