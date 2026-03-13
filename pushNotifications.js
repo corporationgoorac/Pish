@@ -8,13 +8,16 @@ const processedMessages = new Set();
 const processedNotifs = new Set();
 const reactionThrottle = new Set(); // Specifically limits reaction spam
 
+// --- PERFORMANCE CACHES (Ultra-Fast 12-Hour RAM Cache) ---
+const userCache = new Map(); 
+
 // --- NEW FIX: Boot Phase Lock ---
 // Prevents downloading and processing thousands of historical messages on server restart
 let isBooting = true;
 setTimeout(() => { 
     isBooting = false; 
     console.log("🚀 Quantum Boot Phase Complete. Live Listening Active."); 
-}, 10000); // 10-second lock
+}, 2000); // 2-second lock
 
 module.exports = function(app) {
     // --- HEALTH CHECK ROUTES FOR UPTIME MONITORS ---
@@ -44,6 +47,14 @@ module.exports = function(app) {
       secretKey: '99DC07D1A9F9B584F776F46A3353B3C3FC28CB53EFE8B162D57EBAEB37669A6A' 
     });
 
+    // --- BUG FIX: Cache Invalidator ---
+    // Listens for user profile changes so the 12-hour cache doesn't show old names/photos
+    db.collection('users').onSnapshot((snap) => {
+        snap.docChanges().forEach(change => {
+            if (change.type === 'modified') userCache.delete(change.doc.id);
+        });
+    });
+
     // ============================================================================
     // LISTENER 1: CHATS, GROUP CHATS, DIRECT REPLIES, AND REACTIONS
     // ============================================================================
@@ -53,7 +64,7 @@ module.exports = function(app) {
         db.collectionGroup('messages').onSnapshot((snapshot) => {
             snapshot.docChanges().forEach(async (change) => {
                 
-                // STRICT FIX: Ignore all historical snapshot data during the first 10 seconds
+                // STRICT FIX: Ignore all historical snapshot data during the first 2 seconds
                 if (isBooting) return;
 
                 // Handle both new messages AND modified messages (for reactions)
@@ -108,8 +119,17 @@ module.exports = function(app) {
 
                             if (targetUids.length === 0) return; // Abort if no target found
                             
-                            const senderDoc = await db.collection('users').doc(senderUid).get();
-                            const senderData = senderDoc.data() || {};
+                            // HIGH-SPEED CACHE INJECTION (Upgraded to 12 Hours)
+                            let senderData;
+                            if (userCache.has(senderUid)) {
+                                senderData = userCache.get(senderUid);
+                            } else {
+                                const senderDoc = await db.collection('users').doc(senderUid).get();
+                                senderData = senderDoc.data() || {};
+                                userCache.set(senderUid, senderData);
+                                setTimeout(() => userCache.delete(senderUid), 43200000); // 12-hour TTL
+                            }
+
                             let senderName = senderData.name || senderData.username || "Someone";
                             const senderPhoto = senderData.photoURL || "https://www.goorac.biz/icon.png";
                             const senderUsername = senderData.username || senderUid;
@@ -128,13 +148,14 @@ module.exports = function(app) {
                                 ? `https://www.goorac.biz/groupChat.html?id=${chatDocId}` 
                                 : `https://www.goorac.biz/chat.html?user=${senderUsername}`;
 
-                            targetUids.forEach(async (targetUid) => {
-                                await beamsClient.publishToInterests([targetUid], {
+                            // SPEED OPTIMIZATION: Fire all target push notifications in parallel
+                            await Promise.all(targetUids.map(targetUid => 
+                                beamsClient.publishToInterests([targetUid], {
                                     web: { notification: { title: senderName, body: bodyText, icon: senderPhoto, deep_link: deepLink, hide_notification_if_site_has_focus: true }, time_to_live: 3600 },
                                     fcm: { notification: { title: senderName, body: bodyText, icon: senderPhoto }, data: { click_action: deepLink }, priority: "high" },
                                     apns: { aps: { alert: { title: senderName, body: bodyText }, "thread-id": chatDocId }, headers: { "apns-priority": "10", "apns-push-type": "alert" } }
-                                });
-                            });
+                                })
+                            ));
                         } catch (error) { console.error("❌ Message Push Error:", error); }
                     }
 
@@ -177,8 +198,17 @@ module.exports = function(app) {
                                 const chatData = chatDoc.exists ? chatDoc.data() : {};
                                 const isGroup = chatData.isGroup === true;
 
-                                const reactorDoc = await db.collection('users').doc(reactorUid).get();
-                                const reactorInfo = reactorDoc.data() || {};
+                                // HIGH-SPEED CACHE INJECTION (Upgraded to 12 Hours)
+                                let reactorInfo;
+                                if (userCache.has(reactorUid)) {
+                                    reactorInfo = userCache.get(reactorUid);
+                                } else {
+                                    const reactorDoc = await db.collection('users').doc(reactorUid).get();
+                                    reactorInfo = reactorDoc.data() || {};
+                                    userCache.set(reactorUid, reactorInfo);
+                                    setTimeout(() => userCache.delete(reactorUid), 43200000); // 12-hour TTL
+                                }
+
                                 let reactorName = reactorInfo.name || reactorInfo.username || "Someone";
                                 const reactorPhoto = reactorInfo.photoURL || "https://www.goorac.biz/icon.png";
                                 const reactorUsername = reactorInfo.username || reactorUid;
@@ -214,7 +244,7 @@ module.exports = function(app) {
         db.collection('notifications').onSnapshot((snapshot) => {
             snapshot.docChanges().forEach(async (change) => {
                 
-                // STRICT FIX: Ignore all historical snapshot data during the first 10 seconds
+                // STRICT FIX: Ignore all historical snapshot data during the first 2 seconds
                 if (isBooting) return;
 
                 if (change.type === 'added') {
@@ -252,8 +282,17 @@ module.exports = function(app) {
 
                     try {
                         // ALWAYS fetch exact user profile from DB to guarantee Names and PFPs are 100% correct
-                        const senderDoc = await db.collection('users').doc(senderUid).get();
-                        const senderData = senderDoc.data() || {};
+                        // HIGH-SPEED CACHE INJECTION (Upgraded to 12 Hours)
+                        let senderData;
+                        if (userCache.has(senderUid)) {
+                            senderData = userCache.get(senderUid);
+                        } else {
+                            const senderDoc = await db.collection('users').doc(senderUid).get();
+                            senderData = senderDoc.data() || {};
+                            userCache.set(senderUid, senderData);
+                            setTimeout(() => userCache.delete(senderUid), 43200000); // 12-hour TTL
+                        }
+
                         const senderName = senderData.name || senderData.username || notifData.senderName || notifData.fromName || "Someone";
                         const senderPhoto = senderData.photoURL || notifData.senderPfp || notifData.fromPfp || "https://www.goorac.biz/icon.png";
                         
@@ -410,8 +449,17 @@ module.exports = function(app) {
                     setTimeout(() => processedNotifs.delete(throttleKey), 45000); 
 
                     try {
-                        const callerDoc = await db.collection('users').doc(callerUid).get();
-                        const callerInfo = callerDoc.data() || {};
+                        // HIGH-SPEED CACHE INJECTION (Upgraded to 12 Hours)
+                        let callerInfo;
+                        if (userCache.has(callerUid)) {
+                            callerInfo = userCache.get(callerUid);
+                        } else {
+                            const callerDoc = await db.collection('users').doc(callerUid).get();
+                            callerInfo = callerDoc.data() || {};
+                            userCache.set(callerUid, callerInfo);
+                            setTimeout(() => userCache.delete(callerUid), 43200000); // 12-hour TTL
+                        }
+
                         const callerName = callerInfo.name || callerInfo.username || callData.callerName || "Someone";
                         const callerPhoto = callerInfo.photoURL || callData.callerPfp || "https://www.goorac.biz/icon.png";
                         
@@ -456,8 +504,17 @@ module.exports = function(app) {
                     setTimeout(() => processedNotifs.delete(docId), 180000);
 
                     try {
-                        const callerDoc = await db.collection('users').doc(callerUid).get();
-                        const callerInfo = callerDoc.data() || {};
+                        // HIGH-SPEED CACHE INJECTION (Upgraded to 12 Hours)
+                        let callerInfo;
+                        if (userCache.has(callerUid)) {
+                            callerInfo = userCache.get(callerUid);
+                        } else {
+                            const callerDoc = await db.collection('users').doc(callerUid).get();
+                            callerInfo = callerDoc.data() || {};
+                            userCache.set(callerUid, callerInfo);
+                            setTimeout(() => userCache.delete(callerUid), 43200000); // 12-hour TTL
+                        }
+
                         const callerName = callerInfo.name || callerInfo.username || logData.callerName || "Someone";
                         const callerPhoto = callerInfo.photoURL || logData.callerPfp || "https://www.goorac.biz/icon.png";
                         
