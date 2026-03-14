@@ -253,6 +253,12 @@ module.exports = function startScheduledPushes() {
     const randomMsg = eveningMessages[Math.floor(Math.random() * eveningMessages.length)];
     sendBroadcast(randomMsg);
   }, { timezone: "Asia/Kolkata" });
+  // TEST SCHEDULE: Runs every single minute
+  cron.schedule('* * * * *', () => {
+    const randomMsg = morningMessages[Math.floor(Math.random() * morningMessages.length)];
+    sendBroadcast(randomMsg);
+    console.log("TEST CRON FIRED!");
+  }, { timezone: "Asia/Kolkata" });
 
   console.log('⏳ Goorac Quantum Scheduled Notification Service is running...');
 };
