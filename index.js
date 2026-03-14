@@ -23,7 +23,7 @@ const pushNotifications = require('./pushNotifications');
 // WARNING: Double-check the spelling of this file in your folder! 
 // If the file is named "schedulePush.js", you must add the 'c' here. 
 // Linux servers on Render are strictly case-sensitive and spelling-sensitive.
-const startScheduledPushes = require('./shedulePush'); 
+const startScheduledPushes = require('./scheduledPush.js'); 
 
 // ============================================================================
 // 2. MOUNT YOUR ROUTERS
