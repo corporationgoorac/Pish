@@ -254,7 +254,7 @@ class FullSongPicker extends HTMLElement {
         const root = this.shadowRoot;
         
         // --- CONFIGURATION ---
-        this.API_URL = "https://saavn.sumit.co/api/search/songs"; // Updated to JioSaavn API
+        this.API_URL = "https://shiva757-jiosaavan.hf.space/api/search/songs";  // Updated to JioSaavn API
         this.PAGE_SIZE = 20; 
         this.MAX_LIMIT = 50; // Requested: 50 Songs
         // FIXED: Try Direct fetching first (iTunes API supports CORS natively), then fallback to proxies
